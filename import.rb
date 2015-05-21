@@ -165,8 +165,10 @@ class GoogleContacts
           n['label'] = label(number, 'Work')
           numbers.delete(number)
         else # remove work-labeled numbers that are not in the GAL
-          LOGGER.debug "merge: #{contact.email} has non-work number #{n.to_xml}"
-          n.unlink if n['label'] =~ /work/i
+          if n['label'] =~ /work/i
+            LOGGER.debug "merge: #{contact.email} has work number #{n.to_xml} that is not in the GAL"
+            n.unlink
+          end
         end
       }
 
@@ -225,6 +227,8 @@ class GoogleContacts
   def save
     saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
 
+    contacts.at('//xmlns:feed').children.each{|node| node.unlink unless node.name == 'entry' }
+
     contacts.xpath('//xmlns:entry').each{|contact|
       id = corp_email(contact)
       status = @status[id.downcase]
@@ -247,6 +251,7 @@ class GoogleContacts
       case status.action
         when :delete
           saved.deleted += 1
+          contact.children.each{|node| node.unlink unless node.name == 'id' }
           Nokogiri::XML::Builder.with(contact) do |xml|
             xml['batch'].id { xml.text("delete-#{id}") }
             xml['batch'].operation(type: 'delete')
@@ -272,6 +277,19 @@ class GoogleContacts
       end
     }
     LOGGER.debug saved.inspect
+
+#    kept = 0
+#    contacts.xpath('//xmlns:entry').each{|contact|
+#      operation = contact.at('.//batch:operation')
+#      operation = operation['type'] if operation
+#
+#      if operation != 'delete' || kept > 0
+#        contact.unlink
+#      else
+#        kept += 1
+#      end
+#    }
+
     open('update.xml', 'w'){|f| f.write(contacts.to_xml) }
     post('/contacts/default/full/batch', contacts.to_xml) unless OPTS.offline
   end
@@ -363,6 +381,9 @@ class OAB
 end
 
 gc = GoogleContacts.new
+#puts gc.post('/contacts/default/full/batch', open('update-google.xml').read).to_xml
+#exit
+
 oab = OAB.new
 numbers = {}
 oab.each{|record|
