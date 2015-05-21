@@ -273,7 +273,7 @@ class GoogleContacts
     }
     LOGGER.debug saved.inspect
     open('update.xml', 'w'){|f| f.write(contacts.to_xml) }
-    post('/contacts/default/full/batch', contacts.to_xml)
+    post('/contacts/default/full/batch', contacts.to_xml) unless OPTS.offline
   end
 end
 
