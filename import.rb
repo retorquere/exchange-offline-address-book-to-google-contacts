@@ -4,6 +4,7 @@ require 'base64'
 require 'csv'
 require 'ffi'
 require 'json'
+require 'logging'
 require 'net/http'
 require 'nokogiri'
 require 'oauth2'
@@ -17,18 +18,25 @@ require 'uri'
 require 'yaml'
 require_relative 'OabReader'
 
-class Nokogiri::XML::Node
-  attr_accessor :contact_backup
-  attr_accessor :contact_insert
-end
+require 'trollop'
+OPTS = OpenStruct.new(Trollop::options {
+  opt :offline, "Offline"
+  opt :debug, "Debug level", :type => :string, :default => 'warn'
+  opt :code, "Authorization code", :type => :string
+})
+
+LOGGER = Logging.logger(STDOUT)
+LOGGER.level = OPTS.debug.intern
 
 def telephone(num)
   _num = "#{num}".strip
+  _num = "00#{_num}" if _num =~ /^31/
   _num.gsub!(/^\+/, '00')
-  _num.gsub!(/^0031/, '0')
+  _num.gsub!(/^0([1-9])/) { "0031#{$1}" }
   _num.gsub!(/^00/, '+')
-  return nil unless Phony.plausible?(_num)
-  return Phony.format(Phony.normalize(_num), format: :international)
+  return Phony.format(Phony.normalize(_num), format: :international) if Phony.plausible?(_num)
+  LOGGER.debug "Not a plausible number: #{num} (#{_num})"
+  return nil
 end
 
 def label(num, prefix)
@@ -48,20 +56,17 @@ class GoogleContacts
     'openSearch' => "http://a9.com/-/spec/opensearchrss/1.0/"
   }
 
-  def initialize(code=nil)
+  def initialize
     secret = JSON.parse(open('client_secret.json').read)['installed']
     @client = OAuth2::Client.new(secret['client_id'], secret['client_secret'], site: 'https://accounts.google.com', token_url: '/o/oauth2/token', authorize_url: '/o/oauth2/auth')
-    login(code)
+    login
   end
 
-  def login(code=nil)
-    if code == 'offline'
-      @offline = true
-      return
-    end
+  def login
+    return if OPTS.offline
 
-    if code
-      @token = @client.auth_code.get_token(code, :redirect_uri => @@redirect)
+    if OPTS.code
+      @token = @client.auth_code.get_token(OPTS.code, :redirect_uri => @@redirect)
       open('.token.yml', 'w'){|f| f.write(@token.to_hash.to_yaml)}
     elsif File.file?('.token.yml')
       token = OAuth2::AccessToken.from_hash(@client, YAML::load_file('.token.yml'))
@@ -69,25 +74,26 @@ class GoogleContacts
     end
 
     if !@token || @token.expired?
-      STDERR.puts @client.auth_code.authorize_url(scope: 'https://www.google.com/m8/feeds', redirect_uri: @@redirect, access_type: :offline, approval_prompt: :force)
+      LOGGER.debug @client.auth_code.authorize_url(scope: 'https://www.google.com/m8/feeds', redirect_uri: @@redirect, access_type: :offline, approval_prompt: :force)
       exit
     end
   end
 
   def get(url)
-    throw "offline: #{url}" if @offline
+    throw "offline: #{url}" if OPTS.offline
 
     url = "https://www.google.com/m8/feeds#{url}" unless url =~ /^https?:/
-    STDERR.puts ":: #{url}"
+    LOGGER.debug ":: #{url}"
     data = @token.get(url, headers: {'GData-Version' => '3.0'})
     return Nokogiri::XML(data.body)
   end
 
   def han
-    return 'offline' if @offline
+    return 'offline' if OPTS.offline
 
     return @han if @han
     groups = get('/groups/default/full')
+    open('groups.xml', 'w') {|f| f.write(groups.to_xml) }
     @han = groups.at("//xmlns:entry[xmlns:title/text()='HAN']/xmlns:id/text()").to_xml
   end
 
@@ -97,7 +103,7 @@ class GoogleContacts
 
   def contacts
     if !@contacts
-      if @offline
+      if OPTS.offline
         @contacts = Nokogiri::XML(open('contacts.xml'))
       else
         @contacts = get("/contacts/default/full?max-results=10000")
@@ -119,19 +125,29 @@ class GoogleContacts
   def merge(contact)
     return if contact.email.to_s == ''
 
-    #puts "merging #{contact.email}"
+    @status ||= {}
+    @status[contact.email.downcase] ||= OpenStruct.new
+    status = @status[contact.email.downcase]
     contacts
+
+    LOGGER.debug "merging #{contact.email}"
     gcontact = @contact[contact.email.downcase]
     if gcontact
-      contact.contact_backup = contact.to_xml unless contact.contact_backup
+      LOGGER.debug "merge: #{contact.email} found"
+      status.xml = contact.to_xml unless status.xml
+      status.action = :update
+
       numbers = contact.numbers.dup
       gcontact.xpath('.//gd:phoneNumber').each{|n|
-        number = telephone(n.content)
+        LOGGER.debug "#{n.inner_text} => #{telephone(n.inner_text)}"
+        number = telephone(n.inner_text)
         if numbers.include?(number)
           # make sure work numbers are labeled as such
+          LOGGER.debug "#{contact.email}: work number #{number}"
           n['label'] = label(number, 'Work')
           numbers.delete(number)
         else # remove work-labeled numbers that are not in the GAL
+          LOGGER.debug "merge: #{contact.email} has non-work number #{n.to_xml}"
           n.unlink if n['label'] =~ /work/i
         end
       }
@@ -139,6 +155,7 @@ class GoogleContacts
       # add remaining GAL numbers
       numbers.each{|number|
         Nokogiri::XML::Builder.with(gcontact) do |xml|
+          LOGGER.debug "merge: #{contact.email} add work number #{number}"
           xml['gd'].phoneNumber('label' => label(number, 'Work')) { xml.text(number) }
         end
       }
@@ -162,6 +179,9 @@ class GoogleContacts
       end
 
     elsif contact.numbers.length != 0 # new contact with phone numbers
+      LOGGER.debug "merge: new contact #{contact.email}"
+      status.action = :insert
+
       Nokogiri::XML::Builder.with(contacts.at('//xmlns:feed')) do |xml|
         xml.entry('xmlns:gd' => "http://schemas.google.com/g/2005", 'xmlns:gContact' => "http://schemas.google.com/contact/2008") {
           xml.category('scheme'=>"http://schemas.google.com/g/2005#kind", 'term'=>"http://schemas.google.com/contact/2008#contact")
@@ -181,46 +201,64 @@ class GoogleContacts
           }
         }
       end
-      gcontact = @contact[contact.email.downcase] = contacts.at("//xmlns:entry[gd:email[@address='#{contact.email}']]")
-      gcontact.contact_insert = true
     end
   end
 
   def save
-    status = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
+    saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
 
     contacts.xpath('//xmlns:entry').each{|contact|
       id = han_email(contact)
-      if contact.xpath('.//gd:phoneNumber').length == 0 || !(contact.contact_insert || contact.contact_backup)
-        STDERR.puts "deleting #{id}: #{contact.xpath('.//gd:phoneNumber').length}, insert=#{!!contact.contact_insert}, exists=#{!!contact.contact_backup}"
-        status.deleted += 1
-        Nokogiri::XML::Builder.with(contact) do |xml|
-          xml['batch'].id { xml.text("delete-#{id}") }
-          xml['batch'].operation(type: 'delete')
-        end
-      elsif contact.contact_insert
-        status.inserted += 1
-        Nokogiri::XML::Builder.with(contact) do |xml|
-          xml['batch'].id { xml.text("insert-#{id}") }
-          xml['batch'].operation(type: 'insert')
-        end
-      elsif contact.to_xml != contact.contact_backup
-        status.updated += 1
-        Nokogiri::XML::Builder.with(contact) do |xml|
-          xml['batch'].id { xml.text("update-#{id}") }
-          xml['batch'].operation(type: 'update')
-        end
-      else
-        status.retained += 1
-        contact.unlink
+      status = @status[id.downcase]
+
+      if !status
+        LOGGER.debug "#{id} not in GAL"
+        status = OpenStruct.new(action: :delete)
+      end
+
+      if contact.xpath('.//gd:phoneNumber').length == 0
+        LOGGER.debug "#{id} has no numbers"
+        status.action = :delete
+      end
+
+      status.action = :keep if status.action == :update && status.xml == contact.to_xml
+      status.action ||= :keep
+
+      LOGGER.debug "#{status.action} #{id}"
+
+      case status.action
+        when :delete
+          saved.deleted += 1
+          Nokogiri::XML::Builder.with(contact) do |xml|
+            xml['batch'].id { xml.text("delete-#{id}") }
+            xml['batch'].operation(type: 'delete')
+          end
+
+        when :insert
+          saved.inserted += 1
+          Nokogiri::XML::Builder.with(contact) do |xml|
+            xml['batch'].id { xml.text("insert-#{id}") }
+            xml['batch'].operation(type: 'insert')
+          end
+
+        when :update
+          saved.updated += 1
+          Nokogiri::XML::Builder.with(contact) do |xml|
+            xml['batch'].id { xml.text("update-#{id}") }
+            xml['batch'].operation(type: 'update')
+          end
+
+        else
+          saved.retained += 1
+          contact.unlink
       end
     }
-    STDERR.puts status.inspect
+    LOGGER.debug saved.inspect
     open('update.xml', 'w'){|f| f.write(contacts.to_xml) }
   end
 end
 
-if ARGV[0] != 'offline'
+if !OPTS.offline
   module MSPack
     extend FFI::Library
     ffi_lib 'mspack'
@@ -256,18 +294,17 @@ class OAB
     return p ? (p[0] || dflt) : dflt
   end
 
-  def initialize(offline=false)
-    @offline = offline
-    @credentials = OpenStruct.new(YAML.load_file('.exchange.yml')) unless @offline
+  def initialize
+    @credentials = OpenStruct.new(YAML.load_file('.exchange.yml')) unless OPTS.offline
 
-    STDERR.puts "loading GAL"
+    LOGGER.debug "loading GAL"
     @oab = OpenStruct.new({ pointer: File.expand_path(File.join(File.dirname(__FILE__), 'oab.xml')) })
-    download(@oab.pointer) unless @offline
+    download(@oab.pointer) unless OPTS.offline
     gal = Nokogiri::XML(open(@oab.pointer))
     @oab.compressed = File.expand_path(File.join(File.dirname(__FILE__), gal.at('//Full').inner_text))
     @oab.uncompressed = @oab.compressed.sub(/\.lzx$/, '') + '.oab'
     if !File.file?(@oab.uncompressed)
-      throw 'cannot download in offline mode' if @offline
+      throw 'cannot download in offline mode' if OPTS.offline
       Dir[File.expand_path(File.join(File.dirname(__FILE__), '*.lzx'))].each{|lzx| File.unlink(lzx) }
       Dir[File.expand_path(File.join(File.dirname(__FILE__), '*.oab'))].each{|oab| File.unlink(oab) }
       download(@oab.compressed)
@@ -306,8 +343,8 @@ class OAB
   end
 end
 
-gc = GoogleContacts.new(ARGV[0])
-oab = OAB.new(ARGV[0] == 'offline')
+gc = GoogleContacts.new
+oab = OAB.new
 numbers = {}
 oab.each{|record|
   numbers[record.email.downcase] ||= []
