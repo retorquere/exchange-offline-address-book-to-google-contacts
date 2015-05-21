@@ -220,34 +220,32 @@ class GoogleContacts
   end
 end
 
-module MSPack
-  extend FFI::Library
-  ffi_lib 'mspack'
-  attach_function :mspack_create_oab_decompressor, [ :pointer ], :pointer
-  attach_function :mspack_destroy_oab_decompressor, [ :pointer ], :void
-
-  class MSOABDecompressor < FFI::Struct
-    layout :decompress, callback([:pointer, :string, :string], :int),
-           :decompress_incremental, callback([:pointer, :string, :string, :string], :int)
+if ARGV[0] != 'offline'
+  module MSPack
+    extend FFI::Library
+    ffi_lib 'mspack'
+    attach_function :mspack_create_oab_decompressor, [ :pointer ], :pointer
+    attach_function :mspack_destroy_oab_decompressor, [ :pointer ], :void
+  
+    class MSOABDecompressor < FFI::Struct
+      layout :decompress, callback([:pointer, :string, :string], :int),
+             :decompress_incremental, callback([:pointer, :string, :string, :string], :int)
+    end
+  
   end
-
-end
-def cast_to_msoab(pointer)
-  return MSPack::MSOABDecompressor.new(pointer)
-end
-
-def decompress(source, target)
-  c = MSPack.mspack_create_oab_decompressor(nil)
-  msoab = cast_to_msoab(c)
-  msoab[:decompress].call(c, source, target)
-  MSPack.mspack_destroy_oab_decompressor(c)
+  def cast_to_msoab(pointer)
+    return MSPack::MSOABDecompressor.new(pointer)
+  end
+  
+  def decompress(source, target)
+    c = MSPack.mspack_create_oab_decompressor(nil)
+    msoab = cast_to_msoab(c)
+    msoab[:decompress].call(c, source, target)
+    MSPack.mspack_destroy_oab_decompressor(c)
+  end
 end
 
 class OAB
-  def initialize(offline=false)
-    @offline = offline
-  end
-
   def download(file)
     File.unlink(file) if File.file?(file)
     url = "#{@credentials.oab}/#{File.basename(file)}"
@@ -258,8 +256,9 @@ class OAB
     return p ? (p[0] || dflt) : dflt
   end
 
-  def initialize(online=true)
-    @credentials = OpenStruct.new(YAML.load_file('.exchange.yml'))
+  def initialize(offline=false)
+    @offline = offline
+    @credentials = OpenStruct.new(YAML.load_file('.exchange.yml')) unless @offline
 
     STDERR.puts "loading GAL"
     @oab = OpenStruct.new({ pointer: File.expand_path(File.join(File.dirname(__FILE__), 'oab.xml')) })
@@ -308,7 +307,7 @@ class OAB
 end
 
 gc = GoogleContacts.new(ARGV[0])
-oab = OAB.new
+oab = OAB.new(ARGV[0] == 'offline')
 numbers = {}
 oab.each{|record|
   numbers[record.email.downcase] ||= []

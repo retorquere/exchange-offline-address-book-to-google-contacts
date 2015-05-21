@@ -739,28 +739,6 @@ class OabReader
   end
 end
 
-module MSPack
-  extend FFI::Library
-  ffi_lib 'mspack'
-  attach_function :mspack_create_oab_decompressor, [ :pointer ], :pointer
-  attach_function :mspack_destroy_oab_decompressor, [ :pointer ], :void
-
-  class MSOABDecompressor < FFI::Struct
-    layout :decompress, callback([:pointer, :string, :string], :int),
-           :decompress_incremental, callback([:pointer, :string, :string, :string], :int)
-  end
-
-  def cast_to_msoab(pointer)
-    return MSPack::MSOABDecompressor.new(pointer)
-  end
-  def decompress(source, target)
-    c = MSPack.mspack_create_oab_decompressor(nil)
-    msoab = cast_to_msoab(c)
-    msoab[:decompress].call(c, source, target)
-    MSPack.mspack_destroy_oab_decompressor(c)
-  end
-end
-
 if __FILE__ == $0
   oab = ARGV[0] || 'test.oab'
 

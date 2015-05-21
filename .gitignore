@@ -37,3 +37,4 @@ build/
 *.json
 *.oab
 *.lzx
+*.xml
