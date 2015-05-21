@@ -21,14 +21,15 @@ require_relative 'OabReader'
 require 'trollop'
 OPTS = OpenStruct.new(Trollop::options {
   opt :offline, "Offline"
-  opt :debug, "Debug level", :type => :string, :default => 'warn'
-  opt :code, "Authorization code", :type => :string
-  opt :group, "Contacts group", :type => :string, :default => ''
-  opt :domain, "Work domain", :type => :string, :default => 'HAN.nl'
+  opt :log,     "Log level", :type => :string, :default => 'warn'
+  opt :code,    "Authorization code", :type => :string
+  opt :group,   "Contacts group", :type => :string, :default => ''
+  opt :domain,  "Work domain", :type => :string, :default => 'HAN.nl'
+  opt :do,      "Do deletes/updates/inserts", :default => ''
 })
 
 LOGGER = Logging.logger(STDOUT)
-LOGGER.level = OPTS.debug.intern
+LOGGER.level = OPTS.log.intern
 
 def telephone(num)
   _num = "#{num}".strip
@@ -278,20 +279,20 @@ class GoogleContacts
     }
     LOGGER.debug saved.inspect
 
-#    kept = 0
-#    contacts.xpath('//xmlns:entry').each{|contact|
-#      operation = contact.at('.//batch:operation')
-#      operation = operation['type'] if operation
-#
-#      if operation != 'delete' || kept > 0
-#        contact.unlink
-#      else
-#        kept += 1
-#      end
-#    }
+    if OPTS.do != ''
+      contacts.xpath('//xmlns:entry').each_with_index{|contact, i|
+        operation = contact.at('.//batch:operation')
+        operation = operation['type'] if operation
+        contact.unlink unless operation == OPTS.do
+      }
+    end
+    # max 100 ops at a time
+    contacts.xpath('//xmlns:entry').each_with_index{|contact, i|
+      contact.unlink if i >= 100
+    }
 
     open('update.xml', 'w'){|f| f.write(contacts.to_xml) }
-    post('/contacts/default/full/batch', contacts.to_xml) unless OPTS.offline
+    LOGGER.debug post('/contacts/default/full/batch', contacts.to_xml).to_xml unless OPTS.offline
   end
 end
 
@@ -381,7 +382,7 @@ class OAB
 end
 
 gc = GoogleContacts.new
-#puts gc.post('/contacts/default/full/batch', open('update-google.xml').read).to_xml
+#puts gc.post('/contacts/default/full/batch', open('update.xml').read).to_xml
 #exit
 
 oab = OAB.new
