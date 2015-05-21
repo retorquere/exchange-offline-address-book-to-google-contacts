@@ -23,6 +23,8 @@ OPTS = OpenStruct.new(Trollop::options {
   opt :offline, "Offline"
   opt :debug, "Debug level", :type => :string, :default => 'warn'
   opt :code, "Authorization code", :type => :string
+  opt :group, "Contacts group", :type => :string, :default => ''
+  opt :domain, "Work domain", :type => :string, :default => 'HAN.nl'
 })
 
 LOGGER = Logging.logger(STDOUT)
@@ -79,6 +81,15 @@ class GoogleContacts
     end
   end
 
+  def post(url, body)
+    throw "offline: #{url}" if OPTS.offline
+
+    url = "https://www.google.com/m8/feeds#{url}" unless url =~ /^https?:/
+    LOGGER.debug ":: #{url}"
+    data = @token.post(url, body: body, headers: {'GData-Version' => '3.0'})
+    return Nokogiri::XML(data.body)
+  end
+
   def get(url)
     throw "offline: #{url}" if OPTS.offline
 
@@ -88,17 +99,25 @@ class GoogleContacts
     return Nokogiri::XML(data.body)
   end
 
-  def han
-    return 'offline' if OPTS.offline
-
-    return @han if @han
-    groups = get('/groups/default/full')
-    open('groups.xml', 'w') {|f| f.write(groups.to_xml) }
-    @han = groups.at("//xmlns:entry[xmlns:title/text()='HAN']/xmlns:id/text()").to_xml
+  def group
+    if !@group
+      if OPTS.offline
+        groups = Nokogiri::XML(open('groups.xml'))
+      else
+        groups = get('/groups/default/full')
+        open('groups.xml', 'w') {|f| f.write(groups.to_xml) }
+      end
+      if OPTS.group.to_s.strip == ''
+        @group = groups.at("//xmlns:entry[gContact:systemGroup[@id='Coworkers']]/xmlns:id/text()").to_xml
+      else
+        @group = groups.at("//xmlns:entry[xmlns:title/text()='#{OPTS.group}']/xmlns:id/text()").to_xml
+      end
+    end
+    return @group
   end
 
-  def han_email(contact)
-    return contact.xpath('./gd:email').collect{|address| address['address'] }.compact.collect{|address| address.downcase }.detect{|address| address =~ /@han.nl$/ }
+  def corp_email(contact)
+    return contact.xpath('./gd:email').collect{|address| address['address'] }.compact.collect{|address| address.downcase }.detect{|address| address =~ /@#{OPTS.domain}$/i }
   end
 
   def contacts
@@ -111,7 +130,7 @@ class GoogleContacts
       end
       @contact = {}
       @contacts.xpath('//xmlns:entry').each{|contact|
-        email = han_email(contact)
+        email = corp_email(contact)
         if email
           @contact[email.downcase] = contact
         else
@@ -139,7 +158,6 @@ class GoogleContacts
 
       numbers = contact.numbers.dup
       gcontact.xpath('.//gd:phoneNumber').each{|n|
-        LOGGER.debug "#{n.inner_text} => #{telephone(n.inner_text)}"
         number = telephone(n.inner_text)
         if numbers.include?(number)
           # make sure work numbers are labeled as such
@@ -160,10 +178,10 @@ class GoogleContacts
         end
       }
 
-      # add to group HAN
-      if !gcontact.at(".//gContact:groupMembershipInfo[@href='#{han}']")
+      # add to group contacts group
+      if !gcontact.at(".//gContact:groupMembershipInfo[@href='#{group}']")
         Nokogiri::XML::Builder.with(gcontact) do |xml|
-          xml['gContact'].groupMembershipInfo(deleted: "false", href: han)
+          xml['gContact'].groupMembershipInfo(deleted: "false", href: group)
         end
       end
 
@@ -187,13 +205,13 @@ class GoogleContacts
           xml.category('scheme'=>"http://schemas.google.com/g/2005#kind", 'term'=>"http://schemas.google.com/contact/2008#contact")
           xml.title('type' => 'text') { xml.text(contact.fullName) }
           xml['gd'].organization('rel' => "http://schemas.google.com/g/2005#work", 'primary' => "true") {
-            xml['gd'].orgName { xml.text('HAN') }
+            xml['gd'].orgName { xml.text(OPTS.domain.gsub(/\..*/, '')) }
           }
           xml['gd'].email(rel: 'http://schemas.google.com/g/2005#work', address: contact.email)
           contact.numbers.each{|number|
             xml['gd'].phoneNumber(label: (number =~ /^06/ ? 'Work mobile' : 'Work')) { xml.text(number) }
           }
-          xml['gContact'].groupMembershipInfo(deleted: "false", href: han)
+          xml['gContact'].groupMembershipInfo(deleted: "false", href: group)
           xml['gd'].name {
             xml['gd'].givenName { xml.text(contact.givenName) }
             xml['gd'].familyName { xml.text(contact.familyName) }
@@ -208,7 +226,7 @@ class GoogleContacts
     saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
 
     contacts.xpath('//xmlns:entry').each{|contact|
-      id = han_email(contact)
+      id = corp_email(contact)
       status = @status[id.downcase]
 
       if !status
@@ -255,6 +273,7 @@ class GoogleContacts
     }
     LOGGER.debug saved.inspect
     open('update.xml', 'w'){|f| f.write(contacts.to_xml) }
+    post('/contacts/default/full/batch', contacts.to_xml)
   end
 end
 
