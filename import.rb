@@ -48,7 +48,7 @@ end
 def label(num, prefix)
   prefix = [prefix]
   parts = Phony.split(Phony.normalize(telephone(num)))
-  prefix << 'mobile' if parts[0,2] == ['31', '6']
+  prefix << 'Mobile' if parts[0,2] == ['31', '6']
   return prefix.join(' ')
 end
 
@@ -89,6 +89,7 @@ class GoogleContacts
     @contacts.xpath('//xmlns:entry').each{|contact|
       email = corp_email(contact)
       if email
+        contact.xpath('./gContact:userDefinedField').each{|udf| udf.unlink }
         @contact[email.downcase] = contact
       else
         contact.xpath('.//gContact:groupMembershipInfo').each{|group|
@@ -252,8 +253,8 @@ class GoogleContacts
   def action(a)
     return false if OPTS.offline
     return false if OPTS.dry_run
-    retrurn true if OPTS.action == ''
-    retrurn true if OPTS.action == a
+    return true if OPTS.action == ''
+    return true if OPTS.action == a
     return false
   end
 
@@ -261,6 +262,8 @@ class GoogleContacts
     saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
 
     @contacts.at('//xmlns:feed').children.each{|node| node.unlink unless node.name == 'entry' }
+
+    open('update.xml', 'w'){|f| f.write(@contacts.to_xml) } unless OPTS.batch
 
     @contacts.xpath('//xmlns:entry').each{|contact|
       id = corp_email(contact)
@@ -350,7 +353,7 @@ class GoogleContacts
       LOGGER.debug post('/contacts/default/full/batch', @contacts.to_xml).to_xml unless OPTS.offline || OPTS.dry_run
     end
 
-    open('update.xml', 'w'){|f| f.write(@contacts.to_xml) }
+    open('update.xml', 'w'){|f| f.write(@contacts.to_xml) } if OPTS.batch
   end
 end
 
