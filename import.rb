@@ -2,7 +2,6 @@
 
 require 'base64'
 require 'csv'
-require 'diffy'
 require 'ffi'
 require 'json'
 require 'logging'
@@ -60,7 +59,7 @@ class GoogleContacts
       @node = contact
 
       # reset by merge
-      @@action[id] = :delete if id
+      delete! unless id || @@status[id]
 
       # cleanup from asynk
       @node.xpath('./gContact:userDefinedField').each{|udf| udf.unlink }
@@ -84,44 +83,39 @@ class GoogleContacts
       return @@action[id]
     end
 
-    def insert!
-      throw "contact with ID cannot be inserted" if id
-    end
-    def insert?
-      return !id
-    end
-
-    def delete!
-      throw "contact without ID can only be inserted" if !id
-      @@action[id] = :delete
-    end
-    def delete?
-      return false unless id
-      return (@@action[id] == :delete)
-    end
-
-    def update!
-      throw "contact without ID can only be inserted" if !id
-      @@action[id] = :update
-    end
-    def update?
-      return false unless id
-      return (@@action[id] == :update)
-    end
-
-    def keep!
-      throw "contact without ID can only be inserted" if !id
-      @@action[id] = :keep
-    end
-    def keep?
-      return false unless id
-      return (@@action[id] == :keep)
-    end
+    [:insert, :keep, :update, :delete].each{|status|
+      define_method("#{status}!") do
+        set_status(status)
+      end
+      define_method("#{status}?") do
+        return get_status(status)
+      end
+    }
 
     def photo
       photo = @node.at("./xmlns:link[@rel='http://schemas.google.com/contacts/2008/rel#photo']")
       return false unless photo
       return OpenStruct.new(url: photo['href'], etag: photo['gd:etag'])
+    end
+
+    private
+
+    def set_status(status)
+      case status
+        when :insert
+          throw "contact with ID cannot be inserted" if id
+        
+        when :delete, :keep, :update
+          throw "contact without ID can only be inserted" if !id
+          @@action[id] = status
+
+        else
+          throw "Unexpected status #{status.inspect}"
+      end
+    end
+    def get_status
+      return :insert unless id
+      return @@action[id]
     end
   end
 
@@ -341,7 +335,7 @@ class GoogleContacts
   end
 
   def save
-    saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
+    saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0, photo: 0)
 
     # remove all non-entries
     @contacts.at('//xmlns:feed').children.each{|node| node.unlink unless node.name == 'entry' }
@@ -394,9 +388,10 @@ class GoogleContacts
           end
 
         when :keep
-          if action('update')
-            pic = contact.photo
-            put(pic.url, open('photo.png').read, nil, 'image/png') if !pic.etag && File.file?('photo.png')
+          pic = contact.photo
+          if !pic.etag && File.file?('photo.png')
+            put(pic.url, open('photo.png').read, nil, 'image/png') if action('update')
+            saved.photo += 1
           end
 
         else
