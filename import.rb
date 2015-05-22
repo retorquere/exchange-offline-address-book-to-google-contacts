@@ -21,8 +21,10 @@ require_relative 'OabReader'
 require 'trollop'
 OPTS = OpenStruct.new(Trollop::options {
   opt :action,  "delete/update/insert", :default => ''
+  opt :batch,   "Batch updates"
   opt :code,    "Authorization code", :type => :string
   opt :domain,  "Work domain", :type => :string, :default => 'HAN.nl'
+  opt :dry_run, "Dry-run"
   opt :group,   "Contacts group", :type => :string, :default => ''
   opt :log,     "Log level", :type => :string, :default => 'warn'
   opt :offline, "Offline"
@@ -64,6 +66,37 @@ class GoogleContacts
     secret = JSON.parse(open('client_secret.json').read)['installed']
     @client = OAuth2::Client.new(secret['client_id'], secret['client_secret'], site: 'https://accounts.google.com', token_url: '/o/oauth2/token', authorize_url: '/o/oauth2/auth')
     login
+
+    if OPTS.offline
+      groups = Nokogiri::XML(open('groups.xml'))
+    else
+      groups = get('/groups/default/full')
+      open('groups.xml', 'w') {|f| f.write(groups.to_xml) }
+    end
+    if OPTS.group.to_s.strip == ''
+      @group = groups.at("//xmlns:entry[gContact:systemGroup[@id='Coworkers']]/xmlns:id/text()").to_xml
+    else
+      @group = groups.at("//xmlns:entry[xmlns:title/text()='#{OPTS.group}']/xmlns:id/text()").to_xml
+    end
+
+    if OPTS.offline
+      @contacts = Nokogiri::XML(open('contacts.xml'))
+    else
+      @contacts = get("/contacts/default/full?max-results=10000")
+      open('contacts.xml', 'w'){|f| f.write(@contacts.to_xml) }
+    end
+    @contact = {}
+    @contacts.xpath('//xmlns:entry').each{|contact|
+      email = corp_email(contact)
+      if email
+        @contact[email.downcase] = contact
+      else
+        contact.xpath('.//gContact:groupMembershipInfo').each{|group|
+          LOGGER.warn "#{contact.at('.//xmlns:title').inner_text} in coworkers" if group['href'] == @group
+        }
+        contact.unlink
+      end
+    }
   end
 
   def login
@@ -83,12 +116,32 @@ class GoogleContacts
     end
   end
 
+  def put(url, body, etag, content_type='application/atom+xml')
+    throw "offline: #{url}" if OPTS.offline
+
+    url = "https://www.google.com/m8/feeds#{url}" unless url =~ /^https?:/
+    LOGGER.debug "PUT #{url}"
+    headers = {'Content-Type' => content_type, 'GData-Version' => '3.0'}
+    headers['If-Match'] = etag if etag
+    data = @token.put(url, body: body, headers: headers)
+    return Nokogiri::XML(data.body)
+  end
+
+  def delete(url, etag)
+    throw "offline: #{url}" if OPTS.offline
+
+    url = "https://www.google.com/m8/feeds#{url}" unless url =~ /^https?:/
+    LOGGER.debug "DELETE #{url}"
+    data = @token.delete(url, headers: {'If-Match' => etag, 'GData-Version' => '3.0'})
+    return Nokogiri::XML(data.body)
+  end
+
   def post(url, body)
     throw "offline: #{url}" if OPTS.offline
 
     url = "https://www.google.com/m8/feeds#{url}" unless url =~ /^https?:/
-    LOGGER.debug ":: #{url}"
-    data = @token.post(url, body: body, headers: {'GData-Version' => '3.0'})
+    LOGGER.debug "POST #{url}"
+    data = @token.post(url, body: body, headers: {'Content-Type' => 'application/atom+xml', 'GData-Version' => '3.0'})
     return Nokogiri::XML(data.body)
   end
 
@@ -96,51 +149,13 @@ class GoogleContacts
     throw "offline: #{url}" if OPTS.offline
 
     url = "https://www.google.com/m8/feeds#{url}" unless url =~ /^https?:/
-    LOGGER.debug ":: #{url}"
+    LOGGER.debug "GET #{url}"
     data = @token.get(url, headers: {'GData-Version' => '3.0'})
     return Nokogiri::XML(data.body)
   end
 
-  def group
-    if !@group
-      if OPTS.offline
-        groups = Nokogiri::XML(open('groups.xml'))
-      else
-        groups = get('/groups/default/full')
-        open('groups.xml', 'w') {|f| f.write(groups.to_xml) }
-      end
-      if OPTS.group.to_s.strip == ''
-        @group = groups.at("//xmlns:entry[gContact:systemGroup[@id='Coworkers']]/xmlns:id/text()").to_xml
-      else
-        @group = groups.at("//xmlns:entry[xmlns:title/text()='#{OPTS.group}']/xmlns:id/text()").to_xml
-      end
-    end
-    return @group
-  end
-
   def corp_email(contact)
     return contact.xpath('.//gd:email').collect{|address| address['address'] }.compact.collect{|address| address.downcase }.detect{|address| address =~ /@#{OPTS.domain}$/i }
-  end
-
-  def contacts
-    if !@contacts
-      if OPTS.offline
-        @contacts = Nokogiri::XML(open('contacts.xml'))
-      else
-        @contacts = get("/contacts/default/full?max-results=10000")
-        open('contacts.xml', 'w'){|f| f.write(@contacts.to_xml) }
-      end
-      @contact = {}
-      @contacts.xpath('//xmlns:entry').each{|contact|
-        email = corp_email(contact)
-        if email
-          @contact[email.downcase] = contact
-        else
-          contact.unlink
-        end
-      }
-    end
-    return @contacts
   end
 
   def merge(contact)
@@ -149,7 +164,6 @@ class GoogleContacts
     @status ||= {}
     @status[contact.email.downcase] ||= OpenStruct.new
     status = @status[contact.email.downcase]
-    contacts
 
     LOGGER.debug "merging #{contact.email}"
     gcontact = @contact[contact.email.downcase]
@@ -183,9 +197,12 @@ class GoogleContacts
       }
 
       # add to group contacts group
-      if !gcontact.at(".//gContact:groupMembershipInfo[@href='#{group}']")
+      gcontact.xpath('.//gContact:groupMembershipInfo').each{|group|
+        group.unlink unless group['href'] == @group
+      }
+      if !gcontact.at(".//gContact:groupMembershipInfo[@href='#{@group}']")
         Nokogiri::XML::Builder.with(gcontact) do |xml|
-          xml['gContact'].groupMembershipInfo(deleted: "false", href: group)
+          xml['gContact'].groupMembershipInfo(deleted: "false", href: @group)
         end
       end
 
@@ -204,7 +221,7 @@ class GoogleContacts
       LOGGER.debug "merge: new contact #{contact.email}"
       status.action = :insert
 
-      Nokogiri::XML::Builder.with(contacts.at('//xmlns:feed')) do |xml|
+      Nokogiri::XML::Builder.with(@contacts.at('//xmlns:feed')) do |xml|
         xml.entry('xmlns:gd' => "http://schemas.google.com/g/2005", 'xmlns:gContact' => "http://schemas.google.com/contact/2008") {
           xml.category('scheme'=>"http://schemas.google.com/g/2005#kind", 'term'=>"http://schemas.google.com/contact/2008#contact")
           xml.title('type' => 'text') { xml.text(contact.fullName) }
@@ -213,9 +230,9 @@ class GoogleContacts
           }
           xml['gd'].email(rel: 'http://schemas.google.com/g/2005#work', address: contact.email)
           contact.numbers.each{|number|
-            xml['gd'].phoneNumber(label: (number =~ /^06/ ? 'Work mobile' : 'Work')) { xml.text(number) }
+            xml['gd'].phoneNumber(label: label(number, 'Work')) { xml.text(number) }
           }
-          xml['gContact'].groupMembershipInfo(deleted: "false", href: group)
+          xml['gContact'].groupMembershipInfo(deleted: "false", href: @group)
           xml['gd'].name {
             xml['gd'].givenName { xml.text(contact.givenName) }
             xml['gd'].familyName { xml.text(contact.familyName) }
@@ -226,12 +243,26 @@ class GoogleContacts
     end
   end
 
+  def photo(contact)
+    photo = gcontact.at("./xmlns:link[@rel='http://schemas.google.com/contacts/2008/rel#photo']")
+    return false unless photo
+    return OpenStruct.new(url: photo['href'], etag: photo['gd:etag'])
+  end
+
+  def action(a)
+    return false if OPTS.offline
+    return false if OPTS.dry_run
+    retrurn true if OPTS.action == ''
+    retrurn true if OPTS.action == a
+    return false
+  end
+
   def save
     saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
 
-    contacts.at('//xmlns:feed').children.each{|node| node.unlink unless node.name == 'entry' }
+    @contacts.at('//xmlns:feed').children.each{|node| node.unlink unless node.name == 'entry' }
 
-    contacts.xpath('//xmlns:entry').each{|contact|
+    @contacts.xpath('//xmlns:entry').each{|contact|
       id = corp_email(contact)
       throw contact.to_xml if !id
       status = @status[id.downcase]
@@ -247,31 +278,54 @@ class GoogleContacts
       end
 
       status.action = :keep if status.action == :update && status.xml == contact.to_xml
-      status.action ||= :keep
+      status.action ||= :ignore
 
       LOGGER.debug "#{status.action} #{id}"
 
       case status.action
         when :delete
           saved.deleted += 1
+          contact.at('./xmlns:id').content = contact.at("./xmlns:link[@rel='self']")['href']
           contact.children.each{|node| node.unlink unless node.name == 'id' }
-          Nokogiri::XML::Builder.with(contact) do |xml|
-            xml['batch'].id { xml.text("delete-#{id}") }
-            xml['batch'].operation(type: 'delete')
+
+          if OPTS.batch
+            Nokogiri::XML::Builder.with(contact) do |xml|
+              xml['batch'].id { xml.text("delete-#{id}") }
+              xml['batch'].operation(type: 'delete')
+            end
+          elsif action('delete')
+            delete(contact.at('./xmlns:id').inner_text, contact['gd:etag'])
           end
 
         when :insert
           saved.inserted += 1
-          Nokogiri::XML::Builder.with(contact) do |xml|
-            xml['batch'].id { xml.text("insert-#{id}") }
-            xml['batch'].operation(type: 'insert')
+
+          if OPTS.batch
+            Nokogiri::XML::Builder.with(contact) do |xml|
+              xml['batch'].id { xml.text("insert-#{id}") }
+              xml['batch'].operation(type: 'insert')
+            end
+          elsif action('insert')
+            post('/contacts/default/full', contact.dup.to_xml)
           end
 
         when :update
           saved.updated += 1
-          Nokogiri::XML::Builder.with(contact) do |xml|
-            xml['batch'].id { xml.text("update-#{id}") }
-            xml['batch'].operation(type: 'update')
+
+          contact.at('./xmlns:id').content = contact.at("./xmlns:link[@rel='self']")['href']
+          if OPTS.batch
+            Nokogiri::XML::Builder.with(contact) do |xml|
+              xml['batch'].id { xml.text("update-#{id}") }
+              xml['batch'].operation(type: 'update')
+            end
+          elsif action('update')
+            put(contact.at('./xmlns:id').inner_text, contact.dup.to_xml, contact['gd:etag'])
+          end
+
+        when :keep
+          if action('update')
+            pic = photo(contact)
+            put(pic.url, open('photo.png').read, nil, 'image/png') if !pic.etag && File.file?('photo.png')
           end
 
         else
@@ -281,20 +335,22 @@ class GoogleContacts
     }
     LOGGER.debug saved.inspect
 
-    if OPTS.action != ''
-      contacts.xpath('//xmlns:entry').each_with_index{|contact, i|
-        operation = contact.at('.//batch:operation')
-        operation = operation['type'] if operation
-        contact.unlink unless operation == OPTS.action
+    if OPTS.batch
+      if OPTS.action != ''
+        @contacts.xpath('//xmlns:entry').each_with_index{|contact, i|
+          operation = contact.at('.//batch:operation')
+          operation = operation['type'] if operation
+          contact.unlink unless operation == OPTS.action
+        }
+      end
+      # max 100 ops at a time
+      @contacts.xpath('//xmlns:entry').each_with_index{|contact, i|
+        contact.unlink if i >= 100
       }
+      LOGGER.debug post('/contacts/default/full/batch', @contacts.to_xml).to_xml unless OPTS.offline || OPTS.dry_run
     end
-    # max 100 ops at a time
-    contacts.xpath('//xmlns:entry').each_with_index{|contact, i|
-      contact.unlink if i >= 100
-    }
 
-    open('update.xml', 'w'){|f| f.write(contacts.to_xml) }
-    LOGGER.debug post('/contacts/default/full/batch', contacts.to_xml).to_xml unless OPTS.offline
+    open('update.xml', 'w'){|f| f.write(@contacts.to_xml) }
   end
 end
 
