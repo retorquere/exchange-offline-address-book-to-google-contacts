@@ -2,6 +2,7 @@
 
 require 'base64'
 require 'csv'
+require 'diffy'
 require 'ffi'
 require 'json'
 require 'logging'
@@ -53,6 +54,77 @@ def label(num, prefix)
 end
 
 class GoogleContacts
+  class Contact
+    @@action = {}
+    def initialize(contact)
+      @node = contact
+
+      # reset by merge
+      @@action[id] = :delete if id
+
+      # cleanup from asynk
+      @node.xpath('./gContact:userDefinedField').each{|udf| udf.unlink }
+      @corp_email = @node.xpath('.//gd:email').collect{|address| address['address'] }.compact.collect{|address| address.downcase }.detect{|address| address =~ /@#{OPTS.domain}$/i }
+    end
+    attr_reader :node
+    attr_reader :corp_email
+
+    def id
+      id = @node.at('./xmlns:id')
+      return nil unless id
+      return id.inner_text
+    end
+
+    def etag
+      return @node['gd:etag']
+    end
+
+    def action
+      return :insert unless id
+      return @@action[id]
+    end
+
+    def insert!
+      throw "contact with ID cannot be inserted" if id
+    end
+    def insert?
+      return !id
+    end
+
+    def delete!
+      throw "contact without ID can only be inserted" if !id
+      @@action[id] = :delete
+    end
+    def delete?
+      return false unless id
+      return (@@action[id] == :delete)
+    end
+
+    def update!
+      throw "contact without ID can only be inserted" if !id
+      @@action[id] = :update
+    end
+    def update?
+      return false unless id
+      return (@@action[id] == :update)
+    end
+
+    def keep!
+      throw "contact without ID can only be inserted" if !id
+      @@action[id] = :keep
+    end
+    def keep?
+      return false unless id
+      return (@@action[id] == :keep)
+    end
+
+    def photo
+      photo = @node.at("./xmlns:link[@rel='http://schemas.google.com/contacts/2008/rel#photo']")
+      return false unless photo
+      return OpenStruct.new(url: photo['href'], etag: photo['gd:etag'])
+    end
+  end
+
   @@redirect = 'urn:ietf:wg:oauth:2.0:oob'
   @@ns = {
     'default' => "http://www.w3.org/2005/Atom",
@@ -85,17 +157,30 @@ class GoogleContacts
       @contacts = get("/contacts/default/full?max-results=10000")
       open('contacts.xml', 'w'){|f| f.write(@contacts.to_xml) }
     end
+
+    # remove non-corp contacts, register contacts, and remove duplicates
     @contact = {}
     @contacts.xpath('//xmlns:entry').each{|contact|
-      email = corp_email(contact)
-      if email
-        contact.xpath('./gContact:userDefinedField').each{|udf| udf.unlink }
-        @contact[email.downcase] = contact
-      else
-        contact.xpath('.//gContact:groupMembershipInfo').each{|group|
-          LOGGER.warn "#{contact.at('.//xmlns:title').inner_text} in coworkers" if group['href'] == @group
+      contact = Contact.new(contact)
+
+      if !contact.corp_email # not interesting
+        contact.node.unlink
+        next
+      end
+
+      if !@contact[contact.corp_email]
+        @contact[contact.corp_email] = contact.node
+      else # duplicate
+        contact.delete!
+
+        # put missing numbers on first hit
+        original = Contact.new(@contact[contact.corp_email])
+        numbers = original.node.xpath('.//gd:phoneNumber').collect{|n| telephone(n.inner_text) }
+        contact.node.xpath('.//gd:phoneNumber').each{|n|
+          coninue if numbers.include?(telephone(n.inner_text))
+          n.parent = original.node
+          original.update!
         }
-        contact.unlink
       end
     }
   end
@@ -155,72 +240,15 @@ class GoogleContacts
     return Nokogiri::XML(data.body)
   end
 
-  def corp_email(contact)
-    return contact.xpath('.//gd:email').collect{|address| address['address'] }.compact.collect{|address| address.downcase }.detect{|address| address =~ /@#{OPTS.domain}$/i }
-  end
+  def merge(gal)
+    return if gal.email.to_s == ''
 
-  def merge(contact)
-    return if contact.email.to_s == ''
+    contact = @contact[gal.email.downcase]
 
-    @status ||= {}
-    @status[contact.email.downcase] ||= OpenStruct.new
-    status = @status[contact.email.downcase]
+    if !contact
+      return if gal.numbers.length == 0 # new contact but no phone numbers
 
-    LOGGER.debug "merging #{contact.email}"
-    gcontact = @contact[contact.email.downcase]
-    if gcontact
-      LOGGER.debug "merge: #{contact.email} found"
-      status.xml = contact.to_xml unless status.xml
-      status.action = :update
-
-      numbers = contact.numbers.dup
-      gcontact.xpath('.//gd:phoneNumber').each{|n|
-        number = telephone(n.inner_text)
-        if numbers.include?(number)
-          # make sure work numbers are labeled as such
-          LOGGER.debug "#{contact.email}: work number #{number}"
-          n['label'] = label(number, 'Work')
-          numbers.delete(number)
-        else # remove work-labeled numbers that are not in the GAL
-          if n['label'] =~ /work/i
-            LOGGER.debug "merge: #{contact.email} has work number #{n.to_xml} that is not in the GAL"
-            n.unlink
-          end
-        end
-      }
-
-      # add remaining GAL numbers
-      numbers.each{|number|
-        Nokogiri::XML::Builder.with(gcontact) do |xml|
-          LOGGER.debug "merge: #{contact.email} add work number #{number}"
-          xml['gd'].phoneNumber('label' => label(number, 'Work')) { xml.text(number) }
-        end
-      }
-
-      # add to group contacts group
-      gcontact.xpath('.//gContact:groupMembershipInfo').each{|group|
-        group.unlink unless group['href'] == @group
-      }
-      if !gcontact.at(".//gContact:groupMembershipInfo[@href='#{@group}']")
-        Nokogiri::XML::Builder.with(gcontact) do |xml|
-          xml['gContact'].groupMembershipInfo(deleted: "false", href: @group)
-        end
-      end
-
-      # set structured name
-      if !gcontact.at('.//gd:name')
-        Nokogiri::XML::Builder.with(gcontact) do |xml|
-          xml['gd'].name {
-            xml['gd'].givenName { xml.text(contact.givenName) }
-            xml['gd'].familyName { xml.text(contact.familyName) }
-            xml['gd'].fullName { xml.text(contact.fullName) }
-          }
-        end
-      end
-
-    elsif contact.numbers.length != 0 # new contact with phone numbers
-      LOGGER.debug "merge: new contact #{contact.email}"
-      status.action = :insert
+      LOGGER.debug "merge: new contact #{gal.email}"
 
       Nokogiri::XML::Builder.with(@contacts.at('//xmlns:feed')) do |xml|
         xml.entry('xmlns:gd' => "http://schemas.google.com/g/2005", 'xmlns:gContact' => "http://schemas.google.com/contact/2008") {
@@ -241,13 +269,67 @@ class GoogleContacts
           }
         }
       end
+      return
     end
-  end
 
-  def photo(contact)
-    photo = gcontact.at("./xmlns:link[@rel='http://schemas.google.com/contacts/2008/rel#photo']")
-    return false unless photo
-    return OpenStruct.new(url: photo['href'], etag: photo['gd:etag'])
+    contact = Contact.new(contact)
+    contact.keep!
+    LOGGER.debug "merge: merging #{contact.corp_email}"
+
+    numbers = gal.numbers.dup
+    contact.node.xpath('.//gd:phoneNumber').each{|n|
+      number = telephone(n.inner_text)
+      if numbers.include?(number)
+        # make sure work numbers are labeled as such
+        l = label(number, 'Work')
+        if n['label'] != l
+          LOGGER.debug "#{gal.email}: work number #{number}"
+          n['label'] = l
+          n.delete('rel')
+          contact.update!
+        end
+        numbers.delete(number)
+      else # remove work-labeled numbers that are not in the GAL
+        if n['label'] =~ /work/i
+          LOGGER.debug "merge: #{gal.email} has work number #{n.to_xml} that is not in the GAL"
+          n.unlink
+          contact.update!
+        end
+      end
+    }
+
+    # add remaining GAL numbers
+    numbers.each{|number|
+      Nokogiri::XML::Builder.with(contact.node) do |xml|
+        LOGGER.debug "merge: #{gal.email} add work number #{number}"
+        xml['gd'].phoneNumber('label' => label(number, 'Work')) { xml.text(number) }
+        contact.update!
+      end
+    }
+
+    # add to group contacts group
+    contact.node.xpath('.//gContact:groupMembershipInfo').each{|group|
+      next if group['href'] == @group
+      group.unlink
+      contact.update!
+    }
+    if !contact.node.at(".//gContact:groupMembershipInfo[@href='#{@group}']")
+      Nokogiri::XML::Builder.with(contact.node) do |xml|
+        xml['gContact'].groupMembershipInfo(deleted: "false", href: @group)
+        contact.update!
+      end
+    end
+
+    # set structured name
+    #if !gcontact.at('.//gd:name')
+    #  Nokogiri::XML::Builder.with(gcontact) do |xml|
+    #    xml['gd'].name {
+    #      xml['gd'].givenName { xml.text(contact.givenName) }
+    #      xml['gd'].familyName { xml.text(contact.familyName) }
+    #      xml['gd'].fullName { xml.text(contact.fullName) }
+    #    }
+    #  end
+    #end
   end
 
   def action(a)
@@ -261,73 +343,59 @@ class GoogleContacts
   def save
     saved = OpenStruct.new(updated: 0, deleted: 0, inserted: 0, retained: 0)
 
+    # remove all non-entries
     @contacts.at('//xmlns:feed').children.each{|node| node.unlink unless node.name == 'entry' }
 
     open('update.xml', 'w'){|f| f.write(@contacts.to_xml) } unless OPTS.batch
 
     @contacts.xpath('//xmlns:entry').each{|contact|
-      id = corp_email(contact)
-      throw contact.to_xml if !id
-      status = @status[id.downcase]
+      contact = Contact.new(contact)
 
-      if !status
-        LOGGER.debug "#{id} not in GAL"
-        status = OpenStruct.new(action: :delete)
-      end
+      LOGGER.debug "#{contact.corp_email} #{contact.action}"
 
-      if contact.xpath('.//gd:phoneNumber').length == 0
-        LOGGER.debug "#{id} has no numbers"
-        status.action = :delete
-      end
-
-      status.action = :keep if status.action == :update && status.xml == contact.to_xml
-      status.action ||= :ignore
-
-      LOGGER.debug "#{status.action} #{id}"
-
-      case status.action
+      case contact.action
         when :delete
           saved.deleted += 1
-          contact.at('./xmlns:id').content = contact.at("./xmlns:link[@rel='self']")['href']
-          contact.children.each{|node| node.unlink unless node.name == 'id' }
+          contact.node.at('./xmlns:id').content = contact.node.at("./xmlns:link[@rel='self']")['href']
+          contact.node.children.each{|node| node.unlink unless node.name == 'id' }
 
           if OPTS.batch
-            Nokogiri::XML::Builder.with(contact) do |xml|
-              xml['batch'].id { xml.text("delete-#{id}") }
+            Nokogiri::XML::Builder.with(contact.node) do |xml|
+              xml['batch'].id { xml.text("delete-#{contact.corp_email}") }
               xml['batch'].operation(type: 'delete')
             end
           elsif action('delete')
-            delete(contact.at('./xmlns:id').inner_text, contact['gd:etag'])
+            delete(contact.id, contact.etag)
           end
 
         when :insert
           saved.inserted += 1
 
           if OPTS.batch
-            Nokogiri::XML::Builder.with(contact) do |xml|
-              xml['batch'].id { xml.text("insert-#{id}") }
+            Nokogiri::XML::Builder.with(contact.node) do |xml|
+              xml['batch'].id { xml.text("insert-#{contact.corp_email}") }
               xml['batch'].operation(type: 'insert')
             end
           elsif action('insert')
-            post('/contacts/default/full', contact.dup.to_xml)
+            post('/contacts/default/full', contact.node.dup.to_xml)
           end
 
         when :update
           saved.updated += 1
 
-          contact.at('./xmlns:id').content = contact.at("./xmlns:link[@rel='self']")['href']
+          contact.node.at('./xmlns:id').content = contact.node.at("./xmlns:link[@rel='self']")['href']
           if OPTS.batch
-            Nokogiri::XML::Builder.with(contact) do |xml|
-              xml['batch'].id { xml.text("update-#{id}") }
+            Nokogiri::XML::Builder.with(contact.node) do |xml|
+              xml['batch'].id { xml.text("update-#{contact.corp_email}") }
               xml['batch'].operation(type: 'update')
             end
           elsif action('update')
-            put(contact.at('./xmlns:id').inner_text, contact.dup.to_xml, contact['gd:etag'])
+            put(contact.id, contact.node.dup.to_xml, contact.etag)
           end
 
         when :keep
           if action('update')
-            pic = photo(contact)
+            pic = contact.photo
             put(pic.url, open('photo.png').read, nil, 'image/png') if !pic.etag && File.file?('photo.png')
           end
 
