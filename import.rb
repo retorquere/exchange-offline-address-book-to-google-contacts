@@ -345,7 +345,7 @@ class GoogleContacts
     @contacts.xpath('//xmlns:entry').each{|contact|
       contact = Contact.new(contact)
 
-      LOGGER.debug "#{contact.corp_email} #{contact.action}"
+      LOGGER.debug "#{contact.action} #{contact.corp_email}"
 
       case contact.action
         when :delete
