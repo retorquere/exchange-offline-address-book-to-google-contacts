@@ -38,4 +38,5 @@ build/
 *.oab
 *.lzx
 *.xml
+*.log
 photo.png
