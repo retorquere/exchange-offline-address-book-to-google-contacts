@@ -1,6 +1,5 @@
 #!/usr/bin/env ruby
 
-require 'base64'
 require 'csv'
 require 'ffi'
 require 'json'
@@ -14,6 +13,7 @@ require 'ostruct'
 require 'phony'
 require 'pp'
 require 'shellwords'
+require 'singleton'
 require 'uri'
 require 'yaml'
 require_relative 'OabReader'
@@ -25,8 +25,10 @@ OPTS = OpenStruct.new(Trollop::options {
   opt :code,    "Authorization code", :type => :string
   opt :domain,  "Work domain", :type => :string, :default => 'HAN.nl'
   opt :dry_run, "Dry-run"
+  opt :force,   "Force update"
   opt :group,   "Contacts group", :type => :string, :default => ''
   opt :log,     "Log level", :type => :string, :default => 'warn'
+  opt :names,   "Force name update"
   opt :offline, "Offline"
   opt :post,    "Post XML instruction", type: :string, default: ''
 })
@@ -53,13 +55,14 @@ def label(num, prefix)
 end
 
 class GoogleContacts
+  include Singleton
   class Contact
     @@action = {}
     def initialize(contact)
       @node = contact
 
-      # reset by merge
-      delete! unless id || @@status[id]
+      # reset to 'keep' by merge
+      delete! if id && !@@action[id]
 
       # cleanup from asynk
       @node.xpath('./gContact:userDefinedField').each{|udf| udf.unlink }
@@ -80,6 +83,7 @@ class GoogleContacts
 
     def action
       return :insert unless id
+      throw "#{id} has no action assigned?!" unless @@action[id]
       return @@action[id]
     end
 
@@ -106,7 +110,7 @@ class GoogleContacts
           throw "contact with ID cannot be inserted" if id
         
         when :delete, :keep, :update
-          throw "contact without ID can only be inserted" if !id
+          throw "#{status}: contact without ID can only be inserted" if !id
           @@action[id] = status
 
         else
@@ -247,19 +251,19 @@ class GoogleContacts
       Nokogiri::XML::Builder.with(@contacts.at('//xmlns:feed')) do |xml|
         xml.entry('xmlns:gd' => "http://schemas.google.com/g/2005", 'xmlns:gContact' => "http://schemas.google.com/contact/2008") {
           xml.category('scheme'=>"http://schemas.google.com/g/2005#kind", 'term'=>"http://schemas.google.com/contact/2008#contact")
-          xml.title('type' => 'text') { xml.text(contact.fullName) }
+          xml.title('type' => 'text') { xml.text(gal.fullName) }
           xml['gd'].organization('rel' => "http://schemas.google.com/g/2005#work", 'primary' => "true") {
             xml['gd'].orgName { xml.text(OPTS.domain.gsub(/\..*/, '')) }
           }
-          xml['gd'].email(rel: 'http://schemas.google.com/g/2005#work', address: contact.email)
-          contact.numbers.each{|number|
+          xml['gd'].email(rel: 'http://schemas.google.com/g/2005#work', address: gal.email)
+          gal.numbers.each{|number|
             xml['gd'].phoneNumber(label: label(number, 'Work')) { xml.text(number) }
           }
           xml['gContact'].groupMembershipInfo(deleted: "false", href: @group)
           xml['gd'].name {
-            xml['gd'].givenName { xml.text(contact.givenName) }
-            xml['gd'].familyName { xml.text(contact.familyName) }
-            xml['gd'].fullName { xml.text(contact.fullName) }
+            xml['gd'].givenName { xml.text(gal.givenName) }
+            xml['gd'].familyName { xml.text(gal.familyName) }
+            xml['gd'].fullName { xml.text(gal.fullName) }
           }
         }
       end
@@ -315,15 +319,17 @@ class GoogleContacts
     end
 
     # set structured name
-    #if !gcontact.at('.//gd:name')
-    #  Nokogiri::XML::Builder.with(gcontact) do |xml|
-    #    xml['gd'].name {
-    #      xml['gd'].givenName { xml.text(contact.givenName) }
-    #      xml['gd'].familyName { xml.text(contact.familyName) }
-    #      xml['gd'].fullName { xml.text(contact.fullName) }
-    #    }
-    #  end
-    #end
+    if OPTS.names
+      contact.update!
+      contact.node.xpath('.//gd:name').each{|n| n.unlink }
+      Nokogiri::XML::Builder.with(contact.node) do |xml|
+        xml['gd'].name {
+          xml['gd'].givenName { xml.text(gal.givenName) }
+          xml['gd'].familyName { xml.text(gal.familyName) }
+          xml['gd'].fullName { xml.text(gal.fullName) }
+        }
+      end
+    end
   end
 
   def action(a)
@@ -396,7 +402,7 @@ class GoogleContacts
 
         else
           saved.retained += 1
-          contact.unlink
+          contact.node.unlink
       end
     }
     LOGGER.debug saved.inspect
@@ -446,6 +452,8 @@ if !OPTS.offline
 end
 
 class OAB
+  include Singleton
+
   def download(file)
     File.unlink(file) if File.file?(file)
     url = "#{@credentials.oab}/#{File.basename(file)}"
@@ -458,6 +466,7 @@ class OAB
 
   def initialize
     @credentials = OpenStruct.new(YAML.load_file('.exchange.yml')) unless OPTS.offline
+    @updated = OPTS.offline || OPTS.force
 
     LOGGER.debug "loading GAL"
     @oab = OpenStruct.new({ pointer: File.expand_path(File.join(File.dirname(__FILE__), 'oab.xml')) })
@@ -466,13 +475,20 @@ class OAB
     @oab.compressed = File.expand_path(File.join(File.dirname(__FILE__), gal.at('//Full').inner_text))
     @oab.uncompressed = @oab.compressed.sub(/\.lzx$/, '') + '.oab'
     if !File.file?(@oab.uncompressed)
+      @updated = true
       throw 'cannot download in offline mode' if OPTS.offline
-      Dir[File.expand_path(File.join(File.dirname(__FILE__), '*.lzx'))].each{|lzx| File.unlink(lzx) }
-      Dir[File.expand_path(File.join(File.dirname(__FILE__), '*.oab'))].each{|oab| File.unlink(oab) }
+      clear
       download(@oab.compressed)
       decompress(@oab.compressed, @oab.uncompressed)
     end
     @oab.data = OabReader.new(@oab.uncompressed)
+  end
+  attr_reader :updated
+
+  def clear
+    return if OPTS.offline
+    Dir[File.expand_path(File.join(File.dirname(__FILE__), '*.lzx'))].each{|lzx| File.unlink(lzx) }
+    Dir[File.expand_path(File.join(File.dirname(__FILE__), '*.oab'))].each{|oab| File.unlink(oab) }
   end
 
   def each
@@ -505,18 +521,23 @@ class OAB
   end
 end
 
-gc = GoogleContacts.new
-if OPTS.post != ''
-  puts gc.post('/contacts/default/full/batch', open(OPTS.post).read).to_xml
-  exit
-end
+begin
+  if OPTS.post.strip != ''
+    puts GoogleContacts.instance.post('/contacts/default/full/batch', open(OPTS.post).read).to_xml
+    exit
+  end
+  exit unless OAB.instance.updated
 
-oab = OAB.new
-numbers = {}
-oab.each{|record|
-  numbers[record.email.downcase] ||= []
-  numbers[record.email.downcase].concat(record.numbers)
-  record.numbers = numbers[record.email.downcase].uniq.sort
-  gc.merge(record)
-}
-gc.save
+  # merge OAB accounts with the same email address before merging them into google contacts
+  numbers = {}
+  OAB.instance.each{|record|
+    numbers[record.email.downcase] ||= []
+    numbers[record.email.downcase].concat(record.numbers)
+    record.numbers = numbers[record.email.downcase].uniq.sort
+    GoogleContacts.instance.merge(record)
+  }
+rescue => e
+  OAB.instance.clear
+  throw e
+end
+GoogleContacts.instance.save
