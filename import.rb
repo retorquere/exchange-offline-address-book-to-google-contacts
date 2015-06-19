@@ -26,7 +26,7 @@ OPTS = OpenStruct.new(Trollop::options {
   opt :domain,  "Work domain", :type => :string, :default => 'HAN.nl'
   opt :dry_run, "Dry-run"
   opt :force,   "Force update"
-  opt :group,   "Contacts group", :type => :string, :default => ''
+  opt :group,   "Contacts group", :type => :string, :default => 'Coworkers'
   opt :log,     "Log level", :type => :string, :default => 'warn'
   opt :names,   "Force name update"
   opt :offline, "Offline"
@@ -143,11 +143,9 @@ class GoogleContacts
       groups = get('/groups/default/full')
       open('groups.xml', 'w') {|f| f.write(groups.to_xml) }
     end
-    if OPTS.group.to_s.strip == ''
-      @group = groups.at("//xmlns:entry[gContact:systemGroup[@id='Coworkers']]/xmlns:id/text()").to_xml
-    else
-      @group = groups.at("//xmlns:entry[xmlns:title/text()='#{OPTS.group}']/xmlns:id/text()").to_xml
-    end
+    @group = groups.at("//xmlns:entry[gContact:systemGroup/@id='#{OPTS.group}']/xmlns:id/text()")
+    @group ||= groups.at("//xmlns:entry[xmlns:title/text()='#{OPTS.group}']/xmlns:id/text()")
+    @group = @group.to_xml
 
     if OPTS.offline
       @contacts = Nokogiri::XML(open('contacts.xml'))
@@ -538,6 +536,6 @@ begin
   }
 rescue => e
   OAB.instance.clear
-  throw e
+  raise e
 end
 GoogleContacts.instance.save
