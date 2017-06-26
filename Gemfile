@@ -1,10 +1,12 @@
-#ruby=2.2
-#ruby-gemset=GAL
+#ruby=2.3
+#ruby-gemset=oab
 
 source 'https://rubygems.org'
 
+gem 'exchange-offline-address-book'
+gem 'phonelib'
+gem 'dotenv'
+gem 'signet'
+gem 'httparty'
 gem 'nokogiri'
-gem 'oauth2'
-gem 'phony'
-gem 'trollop'
-gem 'logging'
+gem 'hashie'
