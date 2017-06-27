@@ -76,6 +76,8 @@ end
 Google = Class.new do
   class Groups
     def initialize(xml)
+      open(File.join(Config.google.backup, 'groups.xml'), 'w'){|f| f.write(xml.to_xml) } if Config.google.backup
+
       @xml = xml
       @groups = {}
       xml.root.children.each{|group|
@@ -116,6 +118,8 @@ Google = Class.new do
 
   class Contacts
     def initialize(xml)
+      open(File.join(Config.google.backup, 'contacts-downloaded.xml'), 'w'){|f| f.write(xml.to_xml) } if Config.google.backup
+
       @xml = xml
       xml.root.add_namespace('atom', 'http://www.w3.org/2005/Atom')
       xml.root.add_namespace('oab', 'offline-address-book')
@@ -207,16 +211,11 @@ Google = Class.new do
 
     @groups = Groups.new(request('https://www.google.com/m8/feeds/groups/default/full'))
     @contacts = Contacts.new(request('https://www.google.com/m8/feeds/contacts/default/full?max-results=10000'))
-    if Config.google.backup
-      open(File.join(Config.google.backup, 'contacts-downloaded.xml'), 'w'){|f| f.write(@contacts.xml.to_xml) }
-      open(File.join(Config.google.backup, 'groups.xml'), 'w'){|f| f.write(@groups.xml.to_xml) }
-    end
   end
 
   def process
-    if Config.google.backup
-      open(File.join(Config.google.backup, 'contacts-processed.xml'), 'w'){|f| f.write(@contacts.xml.to_xml) }
-    end
+    open(File.join(Config.google.backup, 'contacts-processed.xml'), 'w'){|f| f.write(@contacts.xml.to_xml) } if Config.google.backup
+
     @contacts.xml.root.children.each{|contact|
       next unless contact.name == 'entry'
   
