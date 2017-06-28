@@ -99,8 +99,10 @@ Google = Class.new do
 
       raise 'Work group not set' unless Config.google.group && Config.google.group.work
       @work = @groups[Config.google.group.work] || raise("#{Config.google.group.work.inspect} not found")
-      raise 'Friends group not set' unless Config.google.group && Config.google.group.friends
-      @friends = @groups[Config.google.group.friends] || raise("#{Config.google.group.friends.inspect} not found")
+
+      if Config.google.group && Config.google.group.friends
+        @friends = @groups[Config.google.group.friends] || raise("#{Config.google.group.friends.inspect} not found")
+      end
 
       @starred = @groups['Starred in Android'] || raise("'Starred in Android' not found")
       @my_contacts = @groups['System Group: My Contacts'] || raise("'System Group: My Contacts' not found")
@@ -371,7 +373,7 @@ Exchange.records.each{|record|
   contact.children.each{|group|
     next unless group.name == 'groupMembershipInfo'
     groups[:work] = group if group['href'] == Google.groups.work
-    groups[:friends] = group if group['href'] == Google.groups.friends
+    groups[:friends] = group if Google.groups.friends && group['href'] == Google.groups.friends
     groups[:starred] = group if group['href'] == Google.groups.starred
     groups[:my_contacts] = group if group['href'] == Google.groups.my_contacts
   }
