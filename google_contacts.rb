@@ -27,10 +27,28 @@ class Nokogiri::XML::Element
   end
 
   # contacts
-  def email
+  def email_addresses
     raise "#{self.name} is not a contact" unless self.name == 'entry'
     self.parent.contacts
-    @email ||= self.children.select{|field| field.name == 'email'}.collect{|field| field['address']}.join(' / ')
+    @email_addresses ||= self.children.select{|field| field.name == 'email'}.collect{|field| field['address']}
+  end
+  def work_email(re)
+    @work_email ||= email_addresses.select{|address| address =~ re }
+  end
+  def private_email(re)
+    @private_email ||= email_addresses.select{|address| address !~ re }
+  end
+
+  def phone_numbers
+    raise "#{self.name} is not a contact" unless self.name == 'entry'
+    self.parent.contacts
+    @phone_numbers ||= self.children.select{|field| field.name == 'phoneNumber'}.collect{|field| field['address']}
+  end
+  def work_phones
+    @work_phones ||= phone_numbers.select{|phone| PHONEFIELDS.include?(phone['label'].to_s.to_sym }
+  end
+  def private_phones
+    @private_phones ||= phone_numbers.select{|phone| !PHONEFIELDS.include?(phone['label'].to_s.to_sym }
   end
 
   def _state
