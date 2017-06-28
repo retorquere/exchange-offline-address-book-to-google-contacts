@@ -11,6 +11,7 @@ require 'exchange-offline-address-book'
 require 'phonelib'
 require 'hashie'
 require 'optparse'
+require 'mime/types'
 
 Options = Hashie::Mash.new
 OptionParser.new do |opts|
@@ -18,6 +19,8 @@ OptionParser.new do |opts|
 
   opts.on('-c', '--config FILE', 'Config file') { |v| Options.config = v }
   opts.on('-t', '--token TOKEN', 'Google OAuth token') { |v| Options.token = v }
+  opts.on('-r', '--refresh', 'Refresh all contacts') { |v| Options.refresh = true }
+  opts.on('-d', '--dry-run', "Do anythging but send changes to Google") { |v| Options.dry_run = true }
 end.parse!
 
 Config = Class.new(Hashie::Mash) do
@@ -35,11 +38,12 @@ Config = Class.new(Hashie::Mash) do
     self.locale ||= 'NL'
     Phonelib.default_country = self.locale
 
-    if self.exchange
-      self.exchange.domain ||= self.exchange.email.gsub(/.*@/, '@').downcase if self.exchange.email && self.exchange.email =~ /@/
-      self.exchange.domain ||= self.exchange.username.gsub(/.*@/, '@').downcase if self.exchange.username && self.exchange.username =~ /@/
-      self.exchange.domain.downcase! if self.exchange.domain
-    end
+    self.exchange.domain ||= self.exchange.email.gsub(/.*@/, '').downcase if self.exchange.email && self.exchange.email =~ /@/
+    self.exchange.domain ||= self.exchange.username.gsub(/.*@/, '').downcase if self.exchange.username && self.exchange.username =~ /@/
+    self.exchange.domain.downcase!
+    raise "Domain not set" if self.exchange.domain.to_s == ''
+
+    raise "Photo #{self.photo} not found" if self.photo && !File.file?(self.photo)
 
     self.save
   end
@@ -50,6 +54,8 @@ Config = Class.new(Hashie::Mash) do
     open(@location, 'w'){|f| f.write(config) }
   end
 end.new
+
+EXCHANGE_DOMAIN = /[@\.]#{Config.exchange.domain}$/i
 
 PHONEFIELDS_PRIMARY = [ :BusinessTelephoneNumber, :Business2TelephoneNumber, :MobileTelephoneNumber ]
 PHONEFIELDS_ASSISTANT = [ :Assistant, :AssistantTelephoneNumber, ]
@@ -66,13 +72,16 @@ def set_status(contact, status)
       return
     when 'new:update'
       return
-    when ':strip', ':keep', ':new', ':delete', 'delete:keep', 'keep:update'
+    when ':strip', ':keep', ':new', ':delete', 'delete:keep', 'delete:update', 'keep:update'
       contact['oab:status'] = status
     else
       raise (contact['oab:status'] || '') + ':' + status + ' :: ' + contact.to_xml
   end
 end
 
+def get_email(contact)
+  contact.children.select{|field| field.name == 'email'}.collect{|field| field['address']}.join(' / ')
+end
 Google = Class.new do
   class Groups
     def initialize(xml)
@@ -137,7 +146,7 @@ Google = Class.new do
           next unless field.name == 'email'
           email = field['address'].downcase
           @email[email] = contact
-          if email.end_with?(Config.exchange.domain)
+          if email =~ EXCHANGE_DOMAIN
             on_domain = email
           else
             off_domain = email
@@ -215,6 +224,17 @@ Google = Class.new do
     @contacts = Contacts.new(request('https://www.google.com/m8/feeds/contacts/default/full?max-results=10000'))
   end
 
+  def add_photo(contact)
+    return unless Config.photo
+    photo = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'http://schemas.google.com/contacts/2008/rel#photo' && field['type'] == 'image/*' }
+    return unless photo
+    return if photo['gd:etag'] && !Options.refresh
+
+    @photo_mime_type ||= MIME::Types.type_for(Config.photo)[0].to_s
+    @photo ||= open(Config.photo).read
+    request(photo['href'], method: 'PUT', content_type: @photo_mime_type, body: @photo)
+  end
+
   def process
     open(File.join(Config.google.backup, 'contacts-processed.xml'), 'w'){|f| f.write(@contacts.xml.to_xml) } if Config.google.backup
 
@@ -226,22 +246,24 @@ Google = Class.new do
           next
 
         when 'new'
-          puts "new: #{contact.children.select{|field| field.name == 'email'}.collect{|field| field['address']}}"
+          puts "new: #{get_email(contact)}"
           request('https://www.google.com/m8/feeds/contacts/default/full', method: 'POST', body: contact.to_xml)
 
         when 'update'
-          puts "update: #{contact.children.select{|field| field.name == 'email'}.collect{|field| field['address']}}"
+          puts "update: #{get_email(contact)}"
           link = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'edit'}['href']
           request(link, method: 'PUT', body: contact.to_xml)
 
         when 'delete'
-          puts "delete: #{contact.children.select{|field| field.name == 'email'}.collect{|field| field['address']}}"
+          puts "delete: #{get_email(contact)}"
           link = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'edit'}['href']
           request(link, method: 'DELETE')
 
         else
           raise contact['oab:status']
       end
+
+      add_photo(contact)
     }
   end
 
@@ -249,10 +271,15 @@ Google = Class.new do
 
   private
 
-  def request(uri, body: '', method: 'GET')
+  def request(uri, body: '', method: 'GET', content_type: 'application/atom+xml; charset=UTF-8; type=feed')
+    if Options.dry_run && method != 'GET'
+      puts "Dry run -- not sending #{method} request to #{uri}"
+      return nil
+    end
+
     headers = {
       'GData-Version' =>  '3.0',
-      'Content-Type' => 'application/atom+xml; charset=UTF-8; type=feed',
+      'Content-Type' => content_type,
       'If-Match' => '*',
     }
     #case method
@@ -272,7 +299,7 @@ Google = Class.new do
       when 200, 201
         Nokogiri::XML(response.body)
       else
-        raise "#{uri}: #{response.status.to_s}"
+        raise "#{uri}: #{response.status} #{response.headers} #{response.body}"
     end
   end
 end.new
@@ -332,10 +359,11 @@ end.new
 Exchange.records.each{|record|
   next unless record.SmtpAddress
 
+  raise record.SmtpAddress unless record.SmtpAddress =~ EXCHANGE_DOMAIN
   contact = Google.contacts[record.SmtpAddress]
 
   if contact
-    set_status(contact, 'keep')
+    set_status(contact, Options.refresh ? 'update' : 'keep')
   else
     contact = Google.contacts.create(record.SmtpAddress)
   end
