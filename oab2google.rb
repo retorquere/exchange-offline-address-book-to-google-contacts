@@ -20,6 +20,7 @@ OptionParser.new do |opts|
   opts.on('-c', '--config FILE', 'Config file') { |v| Options.config = v }
   opts.on('-t', '--token TOKEN', 'Google OAuth token') { |v| Options.token = v }
   opts.on('-r', '--refresh', 'Refresh all contacts') { |v| Options.refresh = true }
+  opts.on('-c', '--clean', 'Clean all work contacts') { |v| Options.clean = true }
   opts.on('-d', '--dry-run', "Do anythging but send changes to Google") { |v| Options.dry_run = true }
 end.parse!
 
@@ -67,16 +68,23 @@ def normalize(number)
 end
 
 def set_status(contact, status)
-  case (contact['oab:status'] || '') + ':' + status
+  transition = (contact['oab:status'] || '') + ':' + status
+  case transition
     when status + ':' + status
       return
     when 'new:update'
       return
-    when ':strip', ':keep', ':new', ':delete', 'delete:keep', 'delete:update', 'keep:update'
+    when ':strip', ':delete'
       contact['oab:status'] = status
-    else
-      raise (contact['oab:status'] || '') + ':' + status + ' :: ' + contact.to_xml
+      return
+    when ':keep', ':new', 'delete:keep', 'delete:update', 'keep:update'
+      if !Options.clean
+        contact['oab:status'] = status
+        return
+      end
   end
+
+  raise transition + ' :: ' + contact.to_xml
 end
 
 def get_email(contact)
@@ -141,19 +149,25 @@ Google = Class.new do
 
         on_domain = nil
         off_domain = nil
+        private_phones = false
         emails = []
         contact.children.each{|field|
-          next unless field.name == 'email'
-          email = field['address'].downcase
-          @email[email] = contact
-          if email =~ EXCHANGE_DOMAIN
-            on_domain = email
-          else
-            off_domain = email
+          case field.name
+            when 'email'
+              email = field['address'].downcase
+              @email[email] = contact
+              if email =~ EXCHANGE_DOMAIN
+                on_domain = email
+              else
+                off_domain = email
+              end
+
+            when 'phoneNumber'
+              private_phones ||= !PHONEFIELDS.include?(field['label'].to_s.to_sym)
           end
         }
 
-        if off_domain && on_domain
+        if (off_domain || private_phones) && on_domain
           set_status(contact, 'strip')
         elsif on_domain
           set_status(contact, 'delete')
@@ -253,6 +267,7 @@ Google = Class.new do
           puts "update: #{get_email(contact)}"
           link = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'edit'}['href']
           request(link, method: 'PUT', body: contact.to_xml)
+          add_photo(contact)
 
         when 'delete'
           puts "delete: #{get_email(contact)}"
@@ -260,10 +275,8 @@ Google = Class.new do
           request(link, method: 'DELETE')
 
         else
-          raise contact['oab:status']
+          raise contact['oab:status'] + ' :: ' + contact.to_xml
       end
-
-      add_photo(contact)
     }
   end
 
@@ -357,6 +370,7 @@ Exchange = Class.new do
 end.new
 
 Exchange.records.each{|record|
+  next if Options.clean
   next unless record.SmtpAddress
 
   raise record.SmtpAddress unless record.SmtpAddress =~ EXCHANGE_DOMAIN
