@@ -10,9 +10,10 @@ GEM
       nori
     curb (0.9.3)
     dotenv (2.2.1)
-    exchange-offline-address-book (0.0.17)
+    exchange-offline-address-book (0.0.23)
       autodiscover (~> 1)
       curb (~> 0.9)
+      hashie
       libmspack (~> 0.1)
       nokogiri (~> 1.8)
     faraday (0.12.1)

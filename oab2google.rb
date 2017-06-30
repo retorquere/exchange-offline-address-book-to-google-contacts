@@ -19,9 +19,12 @@ OptionParser.new do |opts|
 
   opts.on('-c', '--config FILE', 'Config file') { |v| Options.config = v }
   opts.on('-t', '--token TOKEN', 'Google OAuth token') { |v| Options.token = v }
-  opts.on('-r', '--refresh', 'Refresh all contacts') { |v| Options.refresh = true }
-  opts.on('-c', '--clean', 'Clean all work contacts') { |v| Options.clean = true }
-  opts.on('-d', '--dry-run', "Do anythging but send changes to Google") { |v| Options.dry_run = true }
+  opts.on('-F', '--force', 'Force-update all contacts') { |v| Options.force = true }
+  opts.on('-f', '--force-photo', 'Force-update photos on all contacts') { |v| Options.force_photo = true }
+  opts.on('-r', '--remove', 'Remove all work contacts from Google contacts') { |v| Options.remove = true }
+  opts.on('-d', '--dry-run', "Do anything but send changes to Google") { |v| Options.dry_run = true }
+  opts.on('-v', '--verbose', "Be chatty") { |v| Options.verbose = true }
+  opts.on('-p', '--proceed', "Proceed on API errors") { |v| Options.proceed = true }
 end.parse!
 
 Config = Class.new(Hashie::Mash) do
@@ -78,7 +81,7 @@ def set_status(contact, status)
       contact['oab:status'] = status
       return
     when ':keep', ':new', 'delete:keep', 'delete:update', 'keep:update'
-      if !Options.clean
+      if !Options.remove
         contact['oab:status'] = status
         return
       end
@@ -90,7 +93,8 @@ end
 def get_email(contact)
   contact.children.select{|field| field.name == 'email'}.collect{|field| field['address']}.join(' / ')
 end
-Google = Class.new do
+
+GoogleAccount = Class.new do
   class Groups
     def initialize(xml)
       open(File.join(Config.google.backup, 'groups.xml'), 'w'){|f| f.write(xml.to_xml) } if Config.google.backup
@@ -234,18 +238,19 @@ Google = Class.new do
       exit
     end
 
-    @groups = Groups.new(request('https://www.google.com/m8/feeds/groups/default/full'))
-    @contacts = Contacts.new(request('https://www.google.com/m8/feeds/contacts/default/full?max-results=10000'))
+    @groups = Groups.new(request('https://www.google.com/m8/feeds/groups/default/full')) || exit
+    @contacts = Contacts.new(request('https://www.google.com/m8/feeds/contacts/default/full?max-results=10000')) || exit
   end
 
   def add_photo(contact)
     return unless Config.photo
     photo = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'http://schemas.google.com/contacts/2008/rel#photo' && field['type'] == 'image/*' }
     return unless photo
-    return if photo['gd:etag'] && !Options.refresh
+    return if photo['gd:etag'] && !Options.force && !Options.force_photo
 
     @photo_mime_type ||= MIME::Types.type_for(Config.photo)[0].to_s
     @photo ||= open(Config.photo).read
+    puts "add photo: #{get_email(contact)}" if Options.verbose
     request(photo['href'], method: 'PUT', content_type: @photo_mime_type, body: @photo)
   end
 
@@ -256,21 +261,23 @@ Google = Class.new do
       next unless contact.name == 'entry'
   
       case contact['oab:status']
-        when nil, 'keep'
+        when nil
           next
 
+        when 'keep'
+          add_photo(contact)
+
         when 'new'
-          puts "new: #{get_email(contact)}"
+          puts "new: #{get_email(contact)}" if Options.verbose
           request('https://www.google.com/m8/feeds/contacts/default/full', method: 'POST', body: contact.to_xml)
 
         when 'update'
-          puts "update: #{get_email(contact)}"
+          puts "update: #{get_email(contact)}" if Options.verbose
           link = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'edit'}['href']
-          request(link, method: 'PUT', body: contact.to_xml)
-          add_photo(contact)
+          request(link, method: 'PUT', body: contact.to_xml) && add_photo(contact)
 
         when 'delete'
-          puts "delete: #{get_email(contact)}"
+          puts "delete: #{get_email(contact)}" if Options.verbose
           link = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'edit'}['href']
           request(link, method: 'DELETE')
 
@@ -310,58 +317,73 @@ Google = Class.new do
 
     case response.status.to_i
       when 200, 201
-        Nokogiri::XML(response.body)
+        return Nokogiri::XML(response.body)
       else
-        raise "#{uri}: #{response.status} #{response.headers} #{response.body}"
+        msg = "#{uri}: #{response.status} #{response.headers} #{response.body}"
+        if Options.proceed
+          puts msg
+          return false
+        else
+          raise msg
+        end
     end
   end
 end.new
 
-Exchange = Class.new do
+ExchangeOAB = Class.new do
   def initialize
-    @oab = OfflineAddressBook.new(
+    puts 'Loading OAB...' if Options.verbose
+    @oab = Exchange::OfflineAddressBook::AddressBook.new(
       username: Config.exchange.username,
       password: Config.exchange.password,
       email: Config.exchange.email,
       cachedir: Config.exchange.cachedir || File.dirname(__FILE__),
       baseurl: Config.exchange.baseurl
     )
+    puts 'OAB loaded' if Options.verbose
 
-    @oab.records.sort_by!{|record| record.SmtpAddress ? record.SmtpAddress.downcase : '' }
+    @cache = @oab.cache.gsub(/\.json$/, '') + '.pruned.json'
 
-    @oab.records.each{|record|
-      numbers = []
-      PHONEFIELDS.each{|kind|
-        if !record[kind]
-          record[kind] = []
-        elsif record[kind].is_a?(String)
-          record[kind] = [ normalize(record[kind]) ]
-        else
-          record[kind] = record[kind].collect{|n| normalize(n) }
-        end
+    if File.file?(@cache)
+      @oab.load(@cache)
+    else
+      @oab.records.sort_by!{|record| record.SmtpAddress ? record.SmtpAddress.downcase : '' }
 
-        record[kind].compact!
-        record[kind].uniq!
-        record[kind] -= numbers
-        numbers += record[kind]
+      @oab.records.each{|record|
+        numbers = []
+        PHONEFIELDS.each{|kind|
+          if !record[kind]
+            record[kind] = []
+          elsif record[kind].is_a?(String)
+            record[kind] = [ normalize(record[kind]) ]
+          else
+            record[kind] = record[kind].collect{|n| normalize(n) }
+          end
+
+          record[kind].compact!
+          record[kind].uniq!
+          record[kind] -= numbers
+          numbers += record[kind]
+        }
       }
-    }
 
-    primary_numbers = @oab.records.collect{|record|
-      PHONEFIELDS_PRIMARY.collect{|kind|
-        record[kind]
+      primary_numbers = @oab.records.collect{|record|
+        PHONEFIELDS_PRIMARY.collect{|kind|
+          record[kind]
+        }
+      }.flatten.uniq
+
+      @oab.records.each{|record|
+        PHONEFIELDS_ASSISTANT.each{|kind|
+          record[kind] = record[kind] - primary_numbers
+        }
       }
-    }.flatten.uniq
 
-    @oab.records.each{|record|
-      PHONEFIELDS_ASSISTANT.each{|kind|
-        record[kind] = record[kind] - primary_numbers
-      }
-    }
+      @oab.records.reject!{|record| PHONEFIELDS.collect{|kind| record[kind]}.flatten.empty? }
+      puts 'OAB pruned' if Options.verbose
 
-    @oab.records.reject!{|record| PHONEFIELDS.collect{|kind| record[kind]}.flatten.empty? }
-
-    open(@oab.cache.sub(/\.json$/, '') + '.yml', 'w') {|f| f.write(@oab.records.to_yaml) }
+      @oab.save(@cache)
+    end
   end
 
   def records
@@ -369,17 +391,17 @@ Exchange = Class.new do
   end
 end.new
 
-Exchange.records.each{|record|
-  next if Options.clean
+ExchangeOAB.records.each{|record|
+  next if Options.remove
   next unless record.SmtpAddress
 
   raise record.SmtpAddress unless record.SmtpAddress =~ EXCHANGE_DOMAIN
-  contact = Google.contacts[record.SmtpAddress]
+  contact = GoogleAccount.contacts[record.SmtpAddress]
 
   if contact
-    set_status(contact, Options.refresh ? 'update' : 'keep')
+    set_status(contact, Options.force ? 'update' : 'keep')
   else
-    contact = Google.contacts.create(record.SmtpAddress)
+    contact = GoogleAccount.contacts.create(record.SmtpAddress)
   end
 
   raise record.SmtpAddress unless contact
@@ -413,15 +435,15 @@ Exchange.records.each{|record|
   groups = {}
   contact.children.each{|group|
     next unless group.name == 'groupMembershipInfo'
-    groups[:work] = group if group['href'] == Google.groups.work
-    groups[:friends] = group if Google.groups.friends && group['href'] == Google.groups.friends
-    groups[:starred] = group if group['href'] == Google.groups.starred
-    groups[:my_contacts] = group if group['href'] == Google.groups.my_contacts
+    groups[:work] = group if group['href'] == GoogleAccount.groups.work
+    groups[:friends] = group if GoogleAccount.groups.friends && group['href'] == GoogleAccount.groups.friends
+    groups[:starred] = group if group['href'] == GoogleAccount.groups.starred
+    groups[:my_contacts] = group if group['href'] == GoogleAccount.groups.my_contacts
   }
   if !groups[:work] && !groups[:friends]
     set_status(contact, 'update')
     Nokogiri::XML::Builder.with(contact) do |xml|   
-      xml['gContact'].groupMembershipInfo(href: Google.groups.work)
+      xml['gContact'].groupMembershipInfo(href: GoogleAccount.groups.work)
     end
     groups[:starred].unlink if groups[:starred]
     groups[:my_contacts].unlink if groups[:my_contacts]
@@ -456,4 +478,4 @@ Exchange.records.each{|record|
   end
 }
 
-Google.process
+GoogleAccount.process
