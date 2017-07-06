@@ -67,7 +67,7 @@ PHONEFIELDS = PHONEFIELDS_PRIMARY + PHONEFIELDS_ASSISTANT
 
 def normalize(number)
   return nil unless Phonelib.valid?(number)
-  return Phonelib.parse(number).to_s
+  return Phonelib.parse(number).international
 end
 
 def set_status(contact, status)
@@ -409,17 +409,21 @@ ExchangeOAB.records.each{|record|
   PHONEFIELDS.each{|kind|
     contact.children.each{|number|
       next unless number.name == 'phoneNumber' and number['label'] == kind.to_s
-      n = normalize(number.text)
+      #n = normalize(number.text)
+      n = number.text
       next unless n
       if record[kind].include?(n)
+        #puts "#{record.SmtpAddress}: keeping #{n}" if Options.verbose
         record[kind].delete(n)
       else
+        #puts "#{record.SmtpAddress}: removing #{n}" if Options.verbose
         number.unlink
         set_status(contact, 'update')
       end
     }
 
     record[kind].each{|n|
+      #puts "#{record.SmtpAddress}: adding #{n}" if Options.verbose
       set_status(contact, 'update')
       Nokogiri::XML::Builder.with(contact) do |xml|   
         xml['gd'].phoneNumber(label: kind.to_s) { xml.text n }
