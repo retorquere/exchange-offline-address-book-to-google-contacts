@@ -172,7 +172,7 @@ GoogleAccount = Class.new do
         }
 
         if (off_domain || private_phones) && on_domain
-          set_status(contact, 'strip')
+          set_status(contact, 'keep')
         elsif on_domain
           set_status(contact, 'delete')
         end
