@@ -1,9 +1,10 @@
-#!/usr/bin/env ruby 
+#!/usr/bin/env ruby
 
 require 'signet/oauth_2/client'
 require 'json'
 require 'yaml'
-require 'nokogiri'
+require 'ox'
+require_relative 'ox_patch'
 require 'singleton'
 require 'httparty'
 require 'dotenv/load'
@@ -13,7 +14,18 @@ require 'hashie'
 require 'optparse'
 require 'mime/types'
 
-Options = Hashie::Mash.new
+Options = Class.new(Hashie::Dash) do
+  property :config
+  property :token
+  property :force
+  property :force
+  property :force_photo
+  property :remove
+  property :dry_run
+  property :verbose
+  property :proceed
+  property :number
+end.new
 OptionParser.new do |opts|
   opts.banner = "Usage: #{File.basename(__FILE__)} [options]"
 
@@ -25,6 +37,7 @@ OptionParser.new do |opts|
   opts.on('-d', '--dry-run', "Do anything but send changes to Google") { |v| Options.dry_run = true }
   opts.on('-v', '--verbose', "Be chatty") { |v| Options.verbose = true }
   opts.on('-p', '--proceed', "Proceed on API errors") { |v| Options.proceed = true }
+  opts.on('-n', '--number N', "Only affect N records") { |v| Options.number = Integer(v) }
 end.parse!
 
 Config = Class.new(Hashie::Mash) do
@@ -70,142 +83,327 @@ def normalize(number)
   return Phonelib.parse(number).international
 end
 
-def set_status(contact, status)
-  transition = (contact['oab:status'] || '') + ':' + status
-  case transition
-    when status + ':' + status
-      return
-    when 'new:update'
-      return
-    when ':strip', ':delete'
-      contact['oab:status'] = status
-      return
-    when ':keep', ':new', 'delete:keep', 'delete:update', 'keep:update'
-      if !Options.remove
-        contact['oab:status'] = status
-        return
-      end
-  end
-
-  raise transition + ' :: ' + contact.to_xml
-end
-
-def get_email(contact)
-  contact.children.select{|field| field.name == 'email'}.collect{|field| field['address']}.join(' / ')
-end
-
 GoogleAccount = Class.new do
-  class Groups
-    def initialize(xml)
-      open(File.join(Config.google.backup, 'groups.xml'), 'w'){|f| f.write(xml.to_xml) } if Config.google.backup
-
-      @xml = xml
-      @groups = {}
-      xml.root.children.each{|group|
-        next unless group.name == 'entry'
-        id = nil
-        name = nil
-        group.children.each{|field|
-          case field.name
-            when 'id'
-              id = field.text
-            when 'title'
-              name = field.text
-          end
-        }
-        if id && name
-          @groups[id] = name
-          @groups[name] = id
-        end
-      }
-      @namespaces = Hash[*xml.root.namespace_definitions.collect{|ns| ['xmlns' + (ns.prefix ? ':' + ns.prefix : ''), ns.href] }.flatten]
-
-      raise 'Work group not set' unless Config.google.group && Config.google.group.work
-      @work = @groups[Config.google.group.work] || raise("#{Config.google.group.work.inspect} not found")
-
-      if Config.google.group && Config.google.group.friends
-        @friends = @groups[Config.google.group.friends] || raise("#{Config.google.group.friends.inspect} not found")
-      end
-
-      @starred = @groups['Starred in Android'] || raise("'Starred in Android' not found")
-      @my_contacts = @groups['System Group: My Contacts'] || raise("'System Group: My Contacts' not found")
+  class Contact
+    if Config.photo
+      @@photo_mime_type = MIME::Types.type_for(Config.photo)[0].to_s
+      @@photo = open(Config.photo).read
     end
 
-    attr_reader :xml, :namespaces
-    attr_reader :work, :friends, :starred, :my_contacts
+    def initialize(node)
+      @node = node
+      @groups = {}
+      @phones = {}
+      PHONEFIELDS.each{|field| @phones[field] = [] }
 
-    def [](id_or_name)
-      @groups[id_or_name]
+      node.nodes.each{|field|
+        next if field.is_a?(String)
+
+        case field.name
+
+        when 'id'
+          @id = field.text
+
+        when 'title'
+          @title = field.text
+
+        when 'link'
+          case field.rel
+          when 'http://schemas.google.com/contacts/2008/rel#photo'
+            @photo = field.href
+            @has_photo = field['gd:etag']
+
+          when 'edit'
+            @edit = field.href
+
+          when 'self'
+            # ignore
+
+          else
+            raise field.name # Ox.dump(node)
+          end
+
+        when 'gd:name'
+          @fullName = field.gd_fullName.text if field.gd_fullName?
+
+        when 'gd:email'
+          @work = field.address if field.address =~ EXCHANGE_DOMAIN
+
+        when 'gd:phoneNumber'
+          @phones[field.label.to_sym] << field.text if field['label'] && PHONEFIELDS.include?(field.label.to_sym)
+
+        when 'gContact:groupMembershipInfo'
+          @groups[field.href] = true if !field['deleted'] || field.deleted == 'false'
+
+        when 'gd:organization'
+          @organization = field.gd_orgName.text if field.gd_orgName?
+
+        when 'updated', 'category', 'content'
+
+        when 'app:edited'
+
+        when 'atom:category'
+
+        when 'gd:structuredPostalAddress', 'gd:extendedProperty', 'gd:im'
+
+        when 'gContact:birthday', 'gContact:fileAs', 'gContact:website', 'gContact:userDefinedField'
+
+        else
+          raise field.name # Ox.dump(node)
+
+        end
+      }
+
+      self.status = @edit ? :delete : :new # assume a work contact needs to be deleted unless later marked present
+    end
+
+    attr_reader :status, :fullName, :node, :work, :photo, :edit, :groups, :organization, :id, :title
+
+    def photo?
+      @has_photo
+    end
+
+    def status=(status)
+      transition = "#{@status}:#{status}"
+
+      case transition
+      when "#{status}:#{status}"
+
+      when 'new:update'
+
+      when ':strip', ':delete'
+        @status = status.to_sym
+
+      when ':keep', ':new', 'delete:keep', 'delete:update', 'keep:update'
+        @status = status.to_sym unless Options.remove
+
+      else
+        raise transition + ' :: ' + self.work
+      end
+    end
+
+    def merge(contact)
+      puts "Merging #{contact.SmtpAddress}" if Options.verbose
+      self.status = :keep if @status == :delete
+
+      if !@node.gd_organization? || !@node.gd_organization.gd_orgName? || @node.gd_organization.gd_orgName.text != Config.google.group.work
+        puts "  Added company #{@work}: #{Config.google.group.work}" if Options.verbose
+        self.status = :update
+        @node.nodes.delete_if{|field|
+          field.name == 'gd:organization'
+        }
+        org = Ox::Element.new('gd:organization')
+        org['rel'] = 'http://schemas.google.com/g/2005#other'
+        org << Ox::Element.new('gd:orgName')
+        org.gd_orgName << Config.google.group.work
+        @node.nodes << org
+      end
+
+      # remove old numbers
+      @node.nodes.delete_if{|field|
+        if field.name != 'gd:phoneNumber' || !field['label'] || !PHONEFIELDS.include?(field.label.to_sym)
+          false
+        elsif contact[field.label.to_sym].include?(field.text)
+          false
+        else
+          puts "  Removed #{@work} #{field.text}" if Options.verbose
+          self.status = :update
+          true
+        end
+      }
+
+      # add new numbers
+      PHONEFIELDS.each{|kind|
+        (contact[kind] - @phones[kind]).each{|number|
+          n = Ox::Element.new('gd:phoneNumber')
+          n['label'] = kind.to_s
+          n << number
+          @node << n
+          puts "  Added #{@work} #{number}"
+          self.status = :update
+        }
+      }
+
+      if @node.gd_phoneNumber!.empty?
+        self.status = :delete
+        return
+      end
+
+      work = GoogleAccount.groups.work
+      friends = GoogleAccount.groups.friends
+      starred = GoogleAccount.groups.starred
+      my_contacts = GoogleAccount.groups.my_contacts
+      if !@groups[work] && !@groups[friends]
+        # no groups assigned, assign to work
+        puts "  Added #{@work} to work"
+        self.status = :update
+
+        group = Ox::Element.new('gContact:groupMembershipInfo')
+        group['href'] = GoogleAccount.groups.work
+        @node.nodes.delete_if{|field|
+          field.name == 'gContact:groupMembershipInfo' && field['href'] && [starred, my_contacts].include?(field['href'])
+        }
+      elsif @groups[work] && @groups[friends]
+        puts "  Removed #{@work} from work"
+        self.status = :update
+        @node.nodes.delete_if{|field|
+          field.name == 'gContact:groupMembershipInfo' && field['href'] == work
+        }
+      elsif @groups[work] && (@groups[starred] || @groups[my_contacts])
+        puts "  Un#{@groups[starred] ? 'starred' : 'mine-d'} #{@work}"
+        self.status = :update
+        @node.nodes.delete_if{|field|
+          field.name == 'gContact:groupMembershipInfo' && field['href'] && [starred, my_contacts].include?(field['href'])
+        }
+      end
+
+      case @status
+      when :new, :update
+          fullname = contact.DisplayName
+          fullname = "#{$2} #{$1}".strip if fullname =~ /^(#{contact.Surname}[^ ]*) (.*)/
+          puts "  #{@status} #{@work} to name #{fullname}"
+          self.status = :update
+          @node.nodes.delete_if{|field|
+            %w{gd:name title}.include?(field.name)
+          }
+
+          name = Ox::Element.new('title')
+          name << fullname
+          @node.nodes << name
+
+          name = Ox::Element.new('gd:name')
+          name << Ox::Element.new('gd:fullName')
+          name.gd_fullName << fullname
+          @node.nodes << name
+
+      when :keep
+
+      else
+        raise @status.inspect
+      end
+    end
+
+    def xml
+      Ox.dump(self.node)
+    end
+
+    def save
+      # do patch & new & delete magic here
+      case @status
+        when :keep
+          return false
+
+        when :new
+          puts "new: #{@work}" if Options.verbose
+          GoogleAccount.request('https://www.google.com/m8/feeds/contacts/default/full', method: 'POST', body: Ox.dump(@node))
+
+        when :update
+          puts "update: #{@work}" if Options.verbose
+          return false unless GoogleAccount.request(@edit, method: 'PUT', body: Ox.dump(@node))
+
+        when :delete
+          if @edit
+            puts "delete: #{@work}" if Options.verbose
+            GoogleAccount.request(@edit, method: 'DELETE')
+          end
+
+        else
+          raise "#{@status}: #{@work}"
+      end
+
+      if Config.photo && self.photo && (!self.photo? || Options.force || Options.force_photo)
+        puts "add photo: #{self.work}" if Options.verbose
+        GoogleAccount.request(self.photo, method: 'PUT', content_type: @@photo_mime_type, body: @@photo)
+      end
+
+      return true
     end
   end
 
   class Contacts
     def initialize(xml)
-      open(File.join(Config.google.backup, 'contacts-downloaded.xml'), 'w'){|f| f.write(xml.to_xml) } if Config.google.backup
+      open(File.join(Config.google.backup, 'contacts.xml'), 'w'){|f| f.write(xml) } if Config.google.backup
+      doc = Ox.parse(xml)
 
-      @xml = xml
-      xml.root.add_namespace('atom', 'http://www.w3.org/2005/Atom')
-      xml.root.add_namespace('oab', 'offline-address-book')
-
-      @email = {}
-      xml.root.children.each{|contact|
-        next unless contact.name == 'entry'
-
-        on_domain = nil
-        off_domain = nil
-        private_phones = false
-        emails = []
-        contact.children.each{|field|
-          case field.name
-            when 'email'
-              email = field['address'].downcase
-              @email[email] = contact
-              if email =~ EXCHANGE_DOMAIN
-                on_domain = email
-              else
-                off_domain = email
-              end
-
-            when 'phoneNumber'
-              private_phones ||= !PHONEFIELDS.include?(field['label'].to_s.to_sym)
-          end
-        }
-
-        if (off_domain || private_phones) && on_domain
-          set_status(contact, 'keep')
-        elsif on_domain
-          set_status(contact, 'delete')
-        end
+      @contacts = {}
+      entry = nil;
+      doc.root.entry!.each{|node|
+        @contacts[entry.work.downcase] = entry if entry && entry.work
+        entry = Contact.new(node)
       }
-
-      @namespaces = Hash[*xml.root.namespace_definitions.collect{|ns| ['xmlns' + (ns.prefix ? ':' + ns.prefix : ''), ns.href] }.flatten]
-      @atom = xml.root.namespace_definitions.detect{|ns| ns.prefix == 'atom'}
+      @contacts[entry.work.downcase] = entry if entry && entry.work
     end
-    attr_reader :xml, :namespaces
+    attr_reader :contacts
 
     def [](email)
-      @email[email.downcase]
-    end
+      @contacts[email.downcase] ||= begin
+        node = Ox::Element.new('entry')
+        node << Ox::Element.new('atom:category')
+        node.atom_category['scheme'] = 'http://schemas.google.com/g/2005#kind'
+        node.atom_category['term'] = 'http://schemas.google.com/contact/2008#contact'
+        node << Ox::Element.new('gd:email')
+        node.gd_email['label'] = Config.google.group.work
+        node.gd_email['address'] = email
 
-    def create(email)
-      @email[email.downcase] ||= begin
-        Nokogiri::XML::Builder.with(xml.root) do |xml|   
-          xml.entry(@namespaces) {
-            xml['atom'].category(scheme: "http://schemas.google.com/g/2005#kind", term: "http://schemas.google.com/contact/2008#contact")
-            xml['gd'].email(label: 'HAN', address: email)
-          }
-        end
+        contact = Contact.new(node)
 
-        contact = xml.root.children.reverse.detect{|contact|
-          next unless contact.name == 'entry'
-          contact.children.detect{|field|
-            field.name == 'email' && field['address'].downcase == email.downcase
-          }
-        }
-        contact.namespace = @atom
-        set_status(contact, 'new')
         contact
       end
+    end
+  end
+
+  class Group
+    def initialize(node)
+      @node = node
+      node.nodes.each{|field|
+        return if field.is_a?(String)
+
+        case field.name
+        when 'id'
+          @id = field.text
+
+        when 'title'
+          @title = field.text
+
+        when 'updated', 'category', 'content', 'link', 'gContact:systemGroup', 'app:edited'
+
+        else
+          raise 'group:' + field.name # Ox.dump(field)
+
+        end
+      }
+    end
+
+    attr_reader :id, :title, :node
+  end
+  class Groups
+    def initialize(xml)
+      open(File.join(Config.google.backup, 'groups.xml'), 'w'){|f| f.write(xml) } if Config.google.backup
+      doc = Ox.parse(xml)
+
+      @groups = {}
+      entry = nil
+      doc.root.entry!.each{|node|
+        @groups[entry.id] = @groups[entry.title] = entry.id if entry
+        entry = Group.new(node)
+      }
+      @groups[entry.id] = @groups[entry.title] = entry.id if entry
+
+      raise 'Work group not set' unless Config.google.group && Config.google.group.work
+      @work = @groups[Config.google.group.work] || raise("Contact group #{Config.google.group.work.inspect} not found in #{@groups.keys.inspect}")
+
+      if Config.google.group.friends
+        @friends = @groups[Config.google.group.friends] || raise("Contact group #{Config.google.group.friends.inspect} not found")
+      end
+
+      @starred = @groups['Starred in Android'] || raise("Contact group 'Starred in Android' not found")
+      @my_contacts = @groups['System Group: My Contacts'] || raise("Contact group 'System Group: My Contacts' not found")
+    end
+    attr_reader :groups
+    attr_reader :work, :friends, :starred, :my_contacts
+
+    def [](id)
+      @groups[id]
     end
   end
 
@@ -218,7 +416,7 @@ GoogleAccount = Class.new do
       :scope => 'https://www.googleapis.com/auth/contacts',
       :redirect_uri => Config.google.secrets.redirect_uris[0],
     )
-  
+
     if Options.token
       @client.code = Options.token
       Config.google.token = @client.fetch_access_token!
@@ -227,12 +425,12 @@ GoogleAccount = Class.new do
       begin
         @client.refresh_token = Config.google.token.refresh_token
         @client.fetch_access_token!
-      rescue 
+      rescue
         Config.google.token = nil
         Config.save
       end
     end
-  
+
     if Config.google.token.nil?
       puts @client.authorization_uri
       exit
@@ -242,24 +440,14 @@ GoogleAccount = Class.new do
     @contacts = Contacts.new(request('https://www.google.com/m8/feeds/contacts/default/full?max-results=10000')) || exit
   end
 
-  def add_photo(contact)
-    return unless Config.photo
-    photo = contact.children.detect{|field| field.name == 'link' && field['rel'] == 'http://schemas.google.com/contacts/2008/rel#photo' && field['type'] == 'image/*' }
-    return unless photo
-    return if photo['gd:etag'] && !Options.force && !Options.force_photo
-
-    @photo_mime_type ||= MIME::Types.type_for(Config.photo)[0].to_s
-    @photo ||= open(Config.photo).read
-    puts "add photo: #{get_email(contact)}" if Options.verbose
-    request(photo['href'], method: 'PUT', content_type: @photo_mime_type, body: @photo)
-  end
 
   def process
+    raise 'to do'
     open(File.join(Config.google.backup, 'contacts-processed.xml'), 'w'){|f| f.write(@contacts.xml.to_xml) } if Config.google.backup
 
     @contacts.xml.root.children.each{|contact|
       next unless contact.name == 'entry'
-  
+
       case contact['oab:status']
         when nil
           next
@@ -289,8 +477,6 @@ GoogleAccount = Class.new do
 
   attr_reader :groups, :contacts
 
-  private
-
   def request(uri, body: '', method: 'GET', content_type: 'application/atom+xml; charset=UTF-8; type=feed')
     if Options.dry_run && method != 'GET'
       puts "Dry run -- not sending #{method} request to #{uri}"
@@ -309,15 +495,15 @@ GoogleAccount = Class.new do
     #    method = 'POST'
     #end
     response = @client.fetch_protected_resource(
-	    method: method,
-	    uri: uri,
-	    headers: headers,
+      method: method,
+      uri: uri,
+      headers: headers,
       body: body,
     )
 
     case response.status.to_i
       when 200, 201
-        return Nokogiri::XML(response.body)
+        return response.body
       else
         msg = "#{uri}: #{response.status} #{response.headers} #{response.body}"
         if Options.proceed
@@ -347,8 +533,6 @@ ExchangeOAB = Class.new do
     if File.file?(@cache)
       @oab.load(@cache)
     else
-      @oab.records.sort_by!{|record| record.SmtpAddress ? record.SmtpAddress.downcase : '' }
-
       @oab.records.each{|record|
         numbers = []
         PHONEFIELDS.each{|kind|
@@ -391,95 +575,17 @@ ExchangeOAB = Class.new do
   end
 end.new
 
+saved = 0
 ExchangeOAB.records.each{|record|
   next if Options.remove
   next unless record.SmtpAddress
 
   raise record.SmtpAddress unless record.SmtpAddress =~ EXCHANGE_DOMAIN
   contact = GoogleAccount.contacts[record.SmtpAddress]
-
-  if contact
-    set_status(contact, Options.force ? 'update' : 'keep')
-  else
-    contact = GoogleAccount.contacts.create(record.SmtpAddress)
-  end
-
-  raise record.SmtpAddress unless contact
-
-  PHONEFIELDS.each{|kind|
-    contact.children.each{|number|
-      next unless number.name == 'phoneNumber' and number['label'] == kind.to_s
-      #n = normalize(number.text)
-      n = number.text
-      next unless n
-      if record[kind].include?(n)
-        #puts "#{record.SmtpAddress}: keeping #{n}" if Options.verbose
-        record[kind].delete(n)
-      else
-        #puts "#{record.SmtpAddress}: removing #{n}" if Options.verbose
-        number.unlink
-        set_status(contact, 'update')
-      end
-    }
-
-    record[kind].each{|n|
-      #puts "#{record.SmtpAddress}: adding #{n}" if Options.verbose
-      set_status(contact, 'update')
-      Nokogiri::XML::Builder.with(contact) do |xml|   
-        xml['gd'].phoneNumber(label: kind.to_s) { xml.text n }
-      end
-    }
-  }
-
-  if contact.children.select{|number| number.name == 'phoneNumber' }.empty?
-    set_status(contact, 'delete')
-    next
-  end
-
-  groups = {}
-  contact.children.each{|group|
-    next unless group.name == 'groupMembershipInfo'
-    groups[:work] = group if group['href'] == GoogleAccount.groups.work
-    groups[:friends] = group if GoogleAccount.groups.friends && group['href'] == GoogleAccount.groups.friends
-    groups[:starred] = group if group['href'] == GoogleAccount.groups.starred
-    groups[:my_contacts] = group if group['href'] == GoogleAccount.groups.my_contacts
-  }
-  if !groups[:work] && !groups[:friends]
-    set_status(contact, 'update')
-    Nokogiri::XML::Builder.with(contact) do |xml|   
-      xml['gContact'].groupMembershipInfo(href: GoogleAccount.groups.work)
-    end
-    groups[:starred].unlink if groups[:starred]
-    groups[:my_contacts].unlink if groups[:my_contacts]
-  elsif groups[:work] && groups[:friends]
-    set_status(contact, 'update')
-    groups[:work].unlink
-  elsif groups[:work] && (groups[:starred] || groups[:my_contacts])
-    set_status(contact, 'update')
-    groups[:starred].unlink if groups[:starred]
-    groups[:my_contacts].unlink if groups[:my_contacts]
-  end
-
-  case contact['oab:status']
-    when 'new', 'update'
-      fullname = record.DisplayName
-      fullname = "#{$2} #{$1}".strip if fullname =~ /^(#{record.Surname}[^ ]*) (.*)/
-
-      contact.children.each{|field|
-        field.unlink if field.name == 'name' || field.name == 'title'
-      }
-
-      Nokogiri::XML::Builder.with(contact) do |xml|   
-        xml.title { xml.text fullname }
-        xml['gd'].name { xml['gd'].fullName { xml.text fullname } }
-      end
-
-    when 'keep'
-      next
-
-    else
-      raise contact['oab:status']
+  contact.merge(record)
+  puts "Merged #{record.SmtpAddress}, status: #{contact.status}" if Options.verbose
+  if contact.save
+    saved += 1
+    exit if !Options.number.nil? && saved >= Options.number
   end
 }
-
-GoogleAccount.process
