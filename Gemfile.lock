@@ -8,7 +8,7 @@ GEM
       logging
       nokogiri
       nori
-    curb (0.9.3)
+    curb (0.9.11)
     dotenv (2.2.1)
     exchange-offline-address-book (0.0.23)
       autodiscover (~> 1)
@@ -18,36 +18,38 @@ GEM
       nokogiri (~> 1.8)
     faraday (0.12.1)
       multipart-post (>= 1.2, < 3)
-    ffi (1.9.18)
-    ffi-compiler2 (2.0.0)
+    ffi (1.15.0)
+    ffi-compiler2 (2.0.1)
       ffi (>= 1.0.0)
       rake
-    hashie (3.5.5)
+    hashie (4.1.0)
     httparty (0.15.5)
       multi_xml (>= 0.5.2)
     httpclient (2.8.3)
     jwt (1.5.6)
-    libmspack (0.1.0)
+    libmspack (0.10.1)
       ffi
       ffi-compiler2 (>= 2.0.0)
     little-plugger (1.1.4)
-    logging (2.2.2)
+    logging (2.3.0)
       little-plugger (~> 1.1)
-      multi_json (~> 1.10)
+      multi_json (~> 1.14)
     mime-types (3.1)
       mime-types-data (~> 3.2015)
     mime-types-data (3.2016.0521)
-    mini_portile2 (2.2.0)
-    multi_json (1.12.1)
+    mini_portile2 (2.5.1)
+    multi_json (1.15.0)
     multi_xml (0.6.0)
     multipart-post (2.0.0)
-    nokogiri (1.8.0)
-      mini_portile2 (~> 2.2.0)
+    nokogiri (1.11.4)
+      mini_portile2 (~> 2.5.0)
+      racc (~> 1.4)
     nori (2.6.0)
     ox (2.5.0)
     phonelib (0.6.12)
     public_suffix (2.0.5)
-    rake (12.0.0)
+    racc (1.5.2)
+    rake (13.0.3)
     signet (0.7.3)
       addressable (~> 2.3)
       faraday (~> 0.9)
@@ -59,14 +61,14 @@ PLATFORMS
 
 DEPENDENCIES
   dotenv
-  exchange-offline-address-book
+  exchange-offline-address-book (>= 0.0.23)
   hashie
   httparty
   mime-types
-  nokogiri
+  nokogiri (>= 1.11.4)
   ox
   phonelib
   signet
 
 BUNDLED WITH
-   1.15.1
+   1.17.3
